@@ -128,62 +128,114 @@ MARS_HEADLINES=(
 
 #############################################
 # Fetch latest Sol images from NASA API
-# Returns: populates $FETCHED_IMAGES array
-# and sets $CURRENT_SOL, $CAMERA_NAMES
+# Strategy:
+#   1. GET /rovers/perseverance (rover manifest)
+#      → gives max_sol (the true latest Sol)
+#   2. GET /rovers/perseverance/photos?sol=MAX_SOL
+#      → gives all photos for that Sol
+# Uses jq for reliable JSON parsing.
+# Populates globals: CURRENT_SOL, FETCHED_IMAGES,
+#                    CAMERA_NAMES, EARTH_DATES
 #############################################
 fetch_mars_images() {
     echo "----------------------------------------"
     echo "Fetching latest Mars 2020 raw images..."
     echo "----------------------------------------"
 
-    # Step 1: Get the latest Sol number
-    local latest_sol_resp
-    latest_sol_resp=$(curl -s \
-        "https://api.nasa.gov/mars-photos/api/v1/rovers/perseverance/latest_photos?api_key=${NASA_API_KEY}&per_page=1" \
-        2>/dev/null || echo "{}")
+    # ── Step 1: rover manifest → latest Sol ──────────────────────────
+    local manifest_url="https://api.nasa.gov/mars-photos/api/v1/rovers/perseverance?api_key=${NASA_API_KEY}"
+    echo "Calling manifest: $manifest_url"
+    local manifest_resp
+    manifest_resp=$(curl -fsSL --max-time 30 "$manifest_url" 2>/dev/null || echo "{}")
 
-    CURRENT_SOL=$(echo "$latest_sol_resp" | grep -o '"sol":[0-9]*' | head -1 | grep -o '[0-9]*')
-    if [ -z "$CURRENT_SOL" ]; then
-        echo "WARNING: Could not determine latest Sol. Trying Sol 1000 as fallback."
-        CURRENT_SOL=1000
+    # jq: .rover.max_sol is the definitive latest Sol in the manifest
+    if command -v jq &>/dev/null; then
+        CURRENT_SOL=$(echo "$manifest_resp" | jq -r '.rover.max_sol // empty' 2>/dev/null)
     fi
-    echo "Latest Sol: $CURRENT_SOL"
 
-    # Step 2: Fetch images for the latest Sol
+    # Fallback: grep for max_sol if jq not available / returned empty
+    if [ -z "${CURRENT_SOL:-}" ]; then
+        CURRENT_SOL=$(echo "$manifest_resp" | grep -o '"max_sol":[0-9]*' | grep -o '[0-9]*' | head -1)
+    fi
+
+    if [ -z "${CURRENT_SOL:-}" ]; then
+        echo "ERROR: Could not parse max_sol from rover manifest."
+        echo "Raw response (first 500 chars): ${manifest_resp:0:500}"
+        return 1
+    fi
+    echo "Latest Sol from manifest: $CURRENT_SOL"
+
+    # ── Step 2: fetch photos for latest Sol ──────────────────────────
+    # NASA API pages at 25 by default; request page 1 explicitly and
+    # cap at MAX_IMAGES so we don't pull hundreds of files.
+    local photos_url="https://api.nasa.gov/mars-photos/api/v1/rovers/perseverance/photos?sol=${CURRENT_SOL}&page=1&per_page=${MAX_IMAGES}&api_key=${NASA_API_KEY}"
+    echo "Calling photos API: $photos_url"
     local api_resp
-    api_resp=$(curl -s \
-        "https://api.nasa.gov/mars-photos/api/v1/rovers/perseverance/photos?sol=${CURRENT_SOL}&api_key=${NASA_API_KEY}&per_page=${MAX_IMAGES}" \
-        2>/dev/null || echo "{}")
+    api_resp=$(curl -fsSL --max-time 60 "$photos_url" 2>/dev/null || echo "{}")
 
-    # Parse image URLs from JSON
+    # ── Step 3: parse with jq (preferred) or grep fallback ───────────
     FETCHED_IMAGES=()
     CAMERA_NAMES=()
     EARTH_DATES=()
 
-    local urls cameras dates
-    # Extract img_src fields
-    while IFS= read -r url; do
-        url="$(echo "$url" | tr -d '"' | sed 's/.*img_src://;s/,.*//;s/ //g')"
-        [ -n "$url" ] && FETCHED_IMAGES+=("$url")
-    done < <(echo "$api_resp" | grep -o '"img_src":"[^"]*"' | head -"$MAX_IMAGES" | sed 's/"img_src":"//;s/"//')
+    if command -v jq &>/dev/null; then
+        # jq outputs one value per line; readarray splits cleanly
+        mapfile -t FETCHED_IMAGES < <(echo "$api_resp" | jq -r '.photos[].img_src'       2>/dev/null | head -"$MAX_IMAGES")
+        mapfile -t CAMERA_NAMES  < <(echo "$api_resp" | jq -r '.photos[].camera.full_name' 2>/dev/null | head -"$MAX_IMAGES")
+        mapfile -t EARTH_DATES   < <(echo "$api_resp" | jq -r '.photos[].earth_date'      2>/dev/null | head -"$MAX_IMAGES")
+    else
+        echo "WARNING: jq not found — falling back to grep parser (less reliable)"
+        while IFS= read -r url; do
+            [ -n "$url" ] && FETCHED_IMAGES+=("$url")
+        done < <(echo "$api_resp" | grep -o '"img_src":"[^"]*"' | sed 's/"img_src":"//;s/"//' | head -"$MAX_IMAGES")
 
-    # Extract camera names
-    while IFS= read -r cam; do
-        CAMERA_NAMES+=("$cam")
-    done < <(echo "$api_resp" | grep -o '"full_name":"[^"]*"' | head -"$MAX_IMAGES" | sed 's/"full_name":"//;s/"//')
+        while IFS= read -r cam; do
+            CAMERA_NAMES+=("$cam")
+        done < <(echo "$api_resp" | grep -o '"full_name":"[^"]*"' | sed 's/"full_name":"//;s/"//' | head -"$MAX_IMAGES")
 
-    # Extract earth dates
-    while IFS= read -r dt; do
-        EARTH_DATES+=("$dt")
-    done < <(echo "$api_resp" | grep -o '"earth_date":"[^"]*"' | head -"$MAX_IMAGES" | sed 's/"earth_date":"//;s/"//')
+        while IFS= read -r dt; do
+            EARTH_DATES+=("$dt")
+        done < <(echo "$api_resp" | grep -o '"earth_date":"[^"]*"' | sed 's/"earth_date":"//;s/"//' | head -"$MAX_IMAGES")
+    fi
 
     local n=${#FETCHED_IMAGES[@]}
     echo "Fetched $n image URLs for Sol $CURRENT_SOL"
 
+    # ── Edge case: latest Sol may have 0 photos yet (uplink delay) ───
+    # Walk back up to 3 Sols until we find images.
     if [ "$n" -eq 0 ]; then
-        echo "ERROR: No images fetched for Sol $CURRENT_SOL"
+        echo "WARNING: No photos for Sol $CURRENT_SOL — walking back up to 3 Sols..."
+        local try_sol
+        for try_sol in $((CURRENT_SOL - 1)) $((CURRENT_SOL - 2)) $((CURRENT_SOL - 3)); do
+            [ "$try_sol" -lt 1 ] && break
+            echo "  Trying Sol $try_sol..."
+            local fallback_resp
+            fallback_resp=$(curl -fsSL --max-time 60 \
+                "https://api.nasa.gov/mars-photos/api/v1/rovers/perseverance/photos?sol=${try_sol}&page=1&per_page=${MAX_IMAGES}&api_key=${NASA_API_KEY}" \
+                2>/dev/null || echo "{}")
+            if command -v jq &>/dev/null; then
+                mapfile -t FETCHED_IMAGES < <(echo "$fallback_resp" | jq -r '.photos[].img_src'        2>/dev/null | head -"$MAX_IMAGES")
+                mapfile -t CAMERA_NAMES  < <(echo "$fallback_resp" | jq -r '.photos[].camera.full_name' 2>/dev/null | head -"$MAX_IMAGES")
+                mapfile -t EARTH_DATES   < <(echo "$fallback_resp" | jq -r '.photos[].earth_date'       2>/dev/null | head -"$MAX_IMAGES")
+            else
+                mapfile -t FETCHED_IMAGES < <(echo "$fallback_resp" | grep -o '"img_src":"[^"]*"' | sed 's/"img_src":"//;s/"//' | head -"$MAX_IMAGES")
+            fi
+            n=${#FETCHED_IMAGES[@]}
+            if [ "$n" -gt 0 ]; then
+                CURRENT_SOL="$try_sol"
+                echo "  Found $n images on Sol $CURRENT_SOL — using this Sol."
+                break
+            fi
+        done
+    fi
+
+    n=${#FETCHED_IMAGES[@]}
+    if [ "$n" -eq 0 ]; then
+        echo "ERROR: No images found for Sol $CURRENT_SOL or the 3 preceding Sols."
         return 1
     fi
+
+    echo "Using Sol $CURRENT_SOL — $n images ready."
     return 0
 }
 
