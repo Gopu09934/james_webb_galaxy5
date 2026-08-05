@@ -48,7 +48,7 @@ CHANNEL_NAME="Mars Live"
 SHADOW="shadowcolor=black@0.6:shadowx=1:shadowy=1"
 INFO_FONTSIZE=19
 INFO_LINE_SPACING=8
-MAX_IMAGES=30              # max images to fetch per Sol
+MAX_IMAGES=150             # max images to fetch per Sol
 VIEWER_MIN_TO_SHOW=10
 
 # SUB icon position in overlay.png (adjust to match yours)
