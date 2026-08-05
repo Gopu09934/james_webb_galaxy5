@@ -1,4 +1,5 @@
-name: Stream
+name: Mars Live Stream
+
 on:
   workflow_dispatch:
     inputs:
@@ -8,10 +9,10 @@ on:
         type: boolean
         default: false
   schedule:
-   - cron: "0 */6 * * *"
+    - cron: "0 */6 * * *"
 
 concurrency:
-  group: stream-job
+  group: mars-stream-job
   cancel-in-progress: true
 
 permissions:
@@ -32,7 +33,7 @@ jobs:
             echo "Scheduled or auto-restarted run — will pull the cached image."
             echo "BUILD=false" >> "$GITHUB_ENV"
           fi
-          echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')/yt-stream" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')/mars-stream" >> "$GITHUB_ENV"
 
       - name: Checkout repository
         if: env.BUILD == 'true'
@@ -63,10 +64,10 @@ jobs:
         if: env.BUILD != 'true'
         run: docker pull "$IMAGE:latest"
 
-      - name: Start YouTube Stream
+      - name: Start Mars Live Stream
         run: |
           docker run \
-            -e VIDEO_URL="${{ secrets.VIDEO_URL }}" \
+            -e NASA_API_KEY="${{ secrets.NASA_API_KEY }}" \
             -e YOUTUBE_STREAM_KEY="${{ secrets.YOUTUBE_STREAM_KEY }}" \
             -e YOUTUBE_API_KEY="${{ secrets.YOUTUBE_API_KEY }}" \
             -e YOUTUBE_CHANNEL_ID="${{ secrets.YOUTUBE_CHANNEL_ID }}" \
