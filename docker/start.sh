@@ -44,7 +44,7 @@ IMAGES_DIR="mars_images"
 SLIDE_DURATION=12          # seconds per image slide
 FACT_SLOT=10               # seconds each Mars fact is shown
 TICKER_SPEED=100           # pixels/second for bottom ticker
-CHANNEL_NAME="Mars Live"
+CHANNEL_NAME="Technical Talk india"
 SHADOW="shadowcolor=black@0.6:shadowx=1:shadowy=1"
 INFO_FONTSIZE=19
 INFO_LINE_SPACING=8
@@ -363,7 +363,7 @@ build_slide_info_chain() {
         local ALPHA="if(between(mod(t\,${CYCLE})\,${start}\,${end})\,if(lt(mod(t\,${CYCLE})-${start}\,0.5)\,(mod(t\,${CYCLE})-${start})/0.5\,if(gt(mod(t\,${CYCLE})-${start}\,${SLIDE_DURATION}-0.5)\,(${end}-mod(t\,${CYCLE}))/0.5\,1))\,0)"
 
         local nxt="si${idx}"
-        chain+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/slide_info${idx}.txt:fontcolor=white:fontsize=${INFO_FONTSIZE}:line_spacing=${INFO_LINE_SPACING}:x=375:y=650:alpha='${ALPHA}':${SHADOW}[${nxt}];"
+        chain+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/slide_info${idx}.txt:fontcolor=white:fontsize=${INFO_FONTSIZE}:line_spacing=${INFO_LINE_SPACING}:x=375:y=560:alpha='${ALPHA}':${SHADOW}[${nxt}];"
         prev="$nxt"
     done
 
@@ -568,7 +568,7 @@ build_full_filter() {
     F+="[tk5]drawtext=fontfile=${FONT}:text='MARS LIVE':fontcolor=white:fontsize=14:x=12:y=695[tk6];"
 
     # ---- Watermark ----
-    F+="[tk6]drawtext=fontfile=${FONT}:text='${CHANNEL_NAME}':fontcolor=white@0.40:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=353:y=655[wm1];"
+    F+="[tk6]drawtext=fontfile=${FONT}:text='${CHANNEL_NAME}':fontcolor=white@0.40:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=353:y=600[wm1];"
 
     # ---- Pulsing subscribe ring ----
     local SUB_PULSE_ENABLE="lt(mod(t\,3)\,1)"
