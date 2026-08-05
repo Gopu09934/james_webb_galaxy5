@@ -385,6 +385,84 @@ date -u +'%d %b %Y  •  %H:%M:%S UTC' > "$ASSET_DIR/clock.txt"
 CLOCK_PID=$!
 
 #############################################
+# Background: Rover Status Stats Writer
+# Writes simulated-but-realistic live stats
+# that update every 30s to feel "alive"
+#############################################
+write_rover_stats() {
+    # Temperature: cycles realistically between -60C (night) and +20C (day)
+    # Based on Sol time approximation from real clock
+    local hour
+    hour=$(date -u +%H)
+    local temp
+    if [ "$hour" -ge 6 ] && [ "$hour" -le 18 ]; then
+        # Daytime — warmer, oscillate around -10 to +15
+        temp=$(( -10 + ( RANDOM % 25 ) ))
+    else
+        # Nighttime — cold, oscillate around -60 to -30
+        temp=$(( -60 + ( RANDOM % 30 ) ))
+    fi
+    printf 'TEMP  %+d C' "$temp" > "$ASSET_DIR/stat_temp.txt"
+
+    # Rover speed: 0 or slow crawl (Perseverance moves ~200m/sol max)
+    local speeds=("STATIONARY" "0.02 m/s" "0.04 m/s" "0.06 m/s" "STATIONARY" "STATIONARY")
+    local spd="${speeds[$((RANDOM % ${#speeds[@]}))]}"
+    printf 'SPEED  %s' "$spd" > "$ASSET_DIR/stat_speed.txt"
+
+    # Power: RTG always generates ~110W, usage varies
+    local power=$(( 90 + RANDOM % 25 ))
+    printf 'POWER  %dW / 110W RTG' "$power" > "$ASSET_DIR/stat_power.txt"
+
+    # Battery: 80-100% (RTG keeps it topped)
+    local batt=$(( 80 + RANDOM % 20 ))
+    printf 'BATT   %d%%' "$batt" > "$ASSET_DIR/stat_batt.txt"
+
+    # Signal: light-time delay varies 3-22 min depending on orbital positions
+    # Use a slowly cycling value so it feels real
+    local sig_min=$(( 3 + ( $(date +%s) / 600 ) % 19 ))
+    printf 'SIGNAL  %d min delay' "$sig_min" > "$ASSET_DIR/stat_signal.txt"
+
+    # Location: rotate through known Perseverance waypoints
+    local locs=(
+        "Jezero Delta Front"
+        "Bright Angel"
+        "Margin Unit"
+        "Witch Hazel"
+        "Rocky Top Ridge"
+        "Curvilinear Unit"
+        "Jezero Crater Floor"
+    )
+    local loc_idx=$(( ( $(date +%s) / 3600 ) % ${#locs[@]} ))
+    printf 'LOC  %s' "${locs[$loc_idx]}" > "$ASSET_DIR/stat_loc.txt"
+
+    # Sol time (Mars local mean solar time approximation)
+    local sol_h=$(( ( $(date -u +%H) * 24 / 24 + 12 ) % 24 ))
+    local sol_m=$(date -u +%M)
+    printf 'SOL TIME  %02d:%02d LMST' "$sol_h" "$sol_m" > "$ASSET_DIR/stat_soltime.txt"
+
+    # Distance driven total (Perseverance real odometry ~20km as of 2026)
+    printf 'ODOMETRY  ~22.4 km total' > "$ASSET_DIR/stat_odo.txt"
+}
+
+# Init stat files
+printf 'TEMP  -- C'          > "$ASSET_DIR/stat_temp.txt"
+printf 'SPEED  --'           > "$ASSET_DIR/stat_speed.txt"
+printf 'POWER  -- W'         > "$ASSET_DIR/stat_power.txt"
+printf 'BATT   -- %%'        > "$ASSET_DIR/stat_batt.txt"
+printf 'SIGNAL  -- min'      > "$ASSET_DIR/stat_signal.txt"
+printf 'LOC  Jezero Crater'  > "$ASSET_DIR/stat_loc.txt"
+printf 'SOL TIME  --:-- LMST' > "$ASSET_DIR/stat_soltime.txt"
+printf 'ODOMETRY  ~22.4 km'  > "$ASSET_DIR/stat_odo.txt"
+
+(
+    while true; do
+        write_rover_stats
+        sleep 30
+    done
+) &
+STATS_PID=$!
+
+#############################################
 # Background subscriber count writer
 #############################################
 printf ' ' > "$ASSET_DIR/subs.txt"
@@ -443,6 +521,7 @@ fi
 trap 'kill "$CLOCK_PID" 2>/dev/null || true
       [ -n "$SUBS_PID" ]    && kill "$SUBS_PID"    2>/dev/null || true
       [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true
+      [ -n "$STATS_PID" ]   && kill "$STATS_PID"   2>/dev/null || true
       echo "Stream ended — cleaning up."' EXIT
 
 #############################################
@@ -526,29 +605,75 @@ build_full_filter() {
     done
 
     # ---- Facts section ----
-    F+="[${prev2}]drawbox=x=33:y=282:w=280:h=2:color=${MARS_RED}@0.5:t=fill[fp0];"
-    F+="[fp0]drawbox=x=33:y=289:w=8:h=8:color=${GOLD}:t=fill[fp0b];"
-    F+="[fp0b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact_label.txt:fontcolor=${GOLD}@0.90:fontsize=12:x=49:y=290[fp1];"
-    local fp_prev="fp1"
+	
+    # ---- SECTION DIVIDER: ROVER STATS ----
+    F+="[${prev2}]drawbox=x=15:y=272:w=316:h=1:color=${MARS_RED}@0.6:t=fill[sec1];"
+    F+="[sec1]drawtext=fontfile=${FONT}:text='ROVER STATUS':fontcolor=${GOLD}:fontsize=10:x=15:y=278[sec1t];"
+    F+="[sec1t]drawbox=x=15:y=290:w=316:h=1:color=white@0.15:t=fill[sec1b];"
+
+    # ---- Temperature (with animated color: blue=cold, orange=warm) ----
+    F+="[sec1b]drawbox=x=15:y=298:w=8:h=8:color=0x4A9EFF:t=fill[tmp_icon];"
+    F+="[tmp_icon]drawtext=fontfile=${FONT}:text='TEMPERATURE':fontcolor=white@0.55:fontsize=10:x=30:y=297[tmp_lbl];"
+    F+="[tmp_lbl]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/stat_temp.txt:reload=1:fontcolor=${GOLD}:fontsize=13:x=30:y=309:${SHADOW}[tmp_val];"
+
+    # ---- Speed ----
+    F+="[tmp_val]drawbox=x=15:y=330:w=8:h=8:color=0x44FF88:t=fill[spd_icon];"
+    F+="[spd_icon]drawtext=fontfile=${FONT}:text='DRIVE SPEED':fontcolor=white@0.55:fontsize=10:x=30:y=329[spd_lbl];"
+    F+="[spd_lbl]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/stat_speed.txt:reload=1:fontcolor=white:fontsize=13:x=30:y=341:${SHADOW}[spd_val];"
+
+    # ---- Location ----
+    F+="[spd_val]drawbox=x=15:y=362:w=8:h=8:color=${MARS_RED}:t=fill[loc_icon];"
+    F+="[loc_icon]drawtext=fontfile=${FONT}:text='LOCATION':fontcolor=white@0.55:fontsize=10:x=30:y=361[loc_lbl];"
+    F+="[loc_lbl]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/stat_loc.txt:reload=1:fontcolor=white:fontsize=13:x=30:y=373:${SHADOW}[loc_val];"
+
+    # ---- Sol Time ----
+    F+="[loc_val]drawbox=x=15:y=394:w=8:h=8:color=${GOLD}:t=fill[st_icon];"
+    F+="[st_icon]drawtext=fontfile=${FONT}:text='MARS LOCAL TIME':fontcolor=white@0.55:fontsize=10:x=30:y=393[st_lbl];"
+    F+="[st_lbl]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/stat_soltime.txt:reload=1:fontcolor=${GOLD}:fontsize=13:x=30:y=405:${SHADOW}[st_val];"
+
+    # ---- Power ----
+    F+="[st_val]drawbox=x=15:y=426:w=8:h=8:color=0xFFD700:t=fill[pwr_icon];"
+    F+="[pwr_icon]drawtext=fontfile=${FONT}:text='RTG POWER':fontcolor=white@0.55:fontsize=10:x=30:y=425[pwr_lbl];"
+    F+="[pwr_lbl]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/stat_power.txt:reload=1:fontcolor=white:fontsize=13:x=30:y=437:${SHADOW}[pwr_val];"
+
+    # ---- Battery bar (animated) ----
+    F+="[pwr_val]drawbox=x=15:y=458:w=316:h=1:color=white@0.10:t=fill[batt_div];"
+    F+="[batt_div]drawtext=fontfile=${FONT}:text='BATTERY':fontcolor=white@0.55:fontsize=10:x=15:y=464[batt_lbl];"
+    # Battery bar background
+    F+="[batt_lbl]drawbox=x=15:y=478:w=200:h=10:color=white@0.15:t=fill[batt_bg];"
+    # Battery bar fill — animates width using sin wave to simulate fluctuation
+    F+="[batt_bg]drawbox=x=15:y=478:w='170+15*sin(t*0.3)':h=10:color=0x44FF44:t=fill[batt_fill];"
+    # Battery percentage text
+    F+="[batt_fill]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/stat_batt.txt:reload=1:fontcolor=0x44FF44:fontsize=11:x=222:y=476[batt_val];"
+
+    # ---- Signal status (pulsing dot) ----
+    F+="[batt_val]drawbox=x=15:y=498:w=316:h=1:color=white@0.10:t=fill[sig_div];"
+    F+="[sig_div]drawtext=fontfile=${FONT}:text='DSN SIGNAL':fontcolor=white@0.55:fontsize=10:x=15:y=504[sig_lbl];"
+    # Pulsing green dot for signal
+    F+="[sig_lbl]drawbox=x=15:y=518:w=10:h=10:color=0x44FF44@0.9:t=fill:enable='lt(mod(t\,2)\,1)'[sig_dot1];"
+    F+="[sig_dot1]drawbox=x=15:y=518:w=10:h=10:color=0x44FF44@0.3:t=fill:enable='gte(mod(t\,2)\,1)'[sig_dot2];"
+    F+="[sig_dot2]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/stat_signal.txt:reload=1:fontcolor=0x44FF44:fontsize=13:x=30:y=516:${SHADOW}[sig_val];"
+
+    # ---- Odometry ----
+    F+="[sig_val]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/stat_odo.txt:reload=1:fontcolor=white@0.70:fontsize=11:x=15:y=538[odo_val];"
+
+    # ---- SECTION DIVIDER: MARS FACT ----
+    F+="[odo_val]drawbox=x=15:y=555:w=316:h=1:color=${MARS_RED}@0.6:t=fill[fact_div];"
+    F+="[fact_div]drawbox=x=15:y=560:w=8:h=8:color=${GOLD}:t=fill[fact_icon];"
+    F+="[fact_icon]drawtext=fontfile=${FONT}:text='MARS FACT':fontcolor=${GOLD}:fontsize=10:x=30:y=558[fact_lbl];"
+    F+="[fact_lbl]drawbox=x=15:y=570:w=316:h=1:color=white@0.10:t=fill[fact_sep];"
+
+    # ---- Facts (rotating, fade in/out) ----
+    local fp_prev="fact_sep"
     for ((i = 0; i < FACT_N; i++)); do
         local fidx=$((i + 1))
         local fstart=$((i * FACT_SLOT))
         local fend=$((fstart + FACT_SLOT))
         local nxt="f${fidx}"
         local FALPHA="if(between(mod(t\,${FACT_CYCLE})\,${fstart}\,${fend})\,if(lt(mod(t\,${FACT_CYCLE})-${fstart}\,0.5)\,(mod(t\,${FACT_CYCLE})-${fstart})/0.5\,if(gt(mod(t\,${FACT_CYCLE})-${fstart}\,${FACT_SLOT}-0.5)\,(${fend}-mod(t\,${FACT_CYCLE}))/0.5\,1))\,0)"
-        F+="[${fp_prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact${fidx}.txt:fontcolor=white@0.90:fontsize=16:line_spacing=7:x=33:y=318:alpha='${FALPHA}'[${nxt}];"
+        F+="[${fp_prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact${fidx}.txt:fontcolor=white@0.85:fontsize=14:line_spacing=8:x=15:y=578:alpha='${FALPHA}'[${nxt}];"
         fp_prev="$nxt"
     done
-
-    # ---- Mission info box (bottom of panel) ----
-    F+="[${fp_prev}]drawbox=x=10:y=560:w=326:h=115:color=black@0.55:t=fill[mi0];"
-    F+="[mi0]drawbox=x=10:y=560:w=5:h=115:color=${MARS_RED}:t=fill[mi1];"
-    F+="[mi1]drawtext=fontfile=${FONT}:text='MISSION STATS':fontcolor=${GOLD}:fontsize=11:x=22:y=567[mi2];"
-    F+="[mi2]drawtext=fontfile=${FONT}:text='Rover\: Perseverance (Percy)':fontcolor=white@0.85:fontsize=13:x=22:y=585[mi3];"
-    F+="[mi3]drawtext=fontfile=${FONT}:text='Landing\: Feb 18\, 2021':fontcolor=white@0.85:fontsize=13:x=22:y=602[mi4];"
-    F+="[mi4]drawtext=fontfile=${FONT}:text='Location\: Jezero Crater':fontcolor=white@0.85:fontsize=13:x=22:y=619[mi5];"
-    F+="[mi5]drawtext=fontfile=${FONT}:text='Sol\: ${CURRENT_SOL}':fontcolor=${MARS_RED}:fontsize=15:x=22:y=638[mi6];"
-    F+="[mi6]drawtext=fontfile=${FONT}:text='Images\: ${DOWNLOAD_COUNT} captured today':fontcolor=white@0.75:fontsize=12:x=22:y=659[mi7];"
 
     # ---- CTA box ----
     local CTA_ALPHA="if(between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})\,if(lt(mod(t\,${CTA_CYCLE})\,0.5)\,mod(t\,${CTA_CYCLE})/0.5\,if(gt(mod(t\,${CTA_CYCLE})\,${CTA_SHOW}-0.5)\,(${CTA_SHOW}-mod(t\,${CTA_CYCLE}))/0.5\,1))\,0)"
