@@ -57,6 +57,42 @@ SUB_ICON_Y=677
 SUB_ICON_R=20
 
 #############################################
+# Background narration (Piper TTS)
+#
+# Reads the fun-fact pool aloud, spaced out
+# every NARRATION_GAP seconds, mixed under the
+# video's own audio with sidechain ducking (the
+# video quiets down while the narrator speaks,
+# then recovers) — same technique real broadcast
+# mixes use, so it doesn't sound like two audio
+# tracks fighting each other.
+#
+# Free + local: Piper is an open-source neural
+# TTS engine baked into the Docker image at build
+# time (see Dockerfile). No API key, no per-run
+# cost, no internet call needed while streaming.
+#############################################
+NARRATION_ENABLED=${NARRATION_ENABLED:-true}
+NARRATION_GAP=50          # seconds between narration lines starting
+NARRATION_LEAD_SILENCE=4  # seconds of silence before the first line
+PIPER_BIN="${PIPER_BIN:-piper}"
+PIPER_VOICE="${PIPER_VOICE:-/app/voices/en_US-lessac-medium.onnx}"
+NARRATION_VOLUME=1.6      # gain applied to the narration voice itself
+NARRATION_DUCK_RATIO=8    # how hard the video's own audio ducks under narration
+
+if [ "$NARRATION_ENABLED" = "true" ]; then
+    if ! command -v "$PIPER_BIN" >/dev/null 2>&1; then
+        echo "NOTICE: Piper TTS binary not found — narration disabled for this run."
+        NARRATION_ENABLED=false
+    elif [ ! -f "$PIPER_VOICE" ]; then
+        echo "NOTICE: Piper voice model not found at ${PIPER_VOICE} — narration disabled for this run."
+        NARRATION_ENABLED=false
+    else
+        echo "Narration: enabled (Piper voice: $(basename "$PIPER_VOICE"))"
+    fi
+fi
+
+#############################################
 # Up-next bumper (shown between videos)
 #############################################
 ENABLE_BUMPER=true
@@ -492,6 +528,83 @@ build_labels_chain() {
 }
 
 #############################################
+# build_narration_track: synthesizes a Piper
+# voice line for each fact in the FACTS array,
+# pads each to NARRATION_GAP seconds of silence,
+# and concatenates them into one looping track
+# (narration_cycle.wav). run_video() then loops
+# that file under the video for its full runtime.
+#
+# Sets NARRATION_AVAILABLE=true/false and, when
+# true, NARRATION_FILE to the track's path.
+# Fails soft: any error here just disables
+# narration for this video and lets the stream
+# continue with visuals + original audio only.
+#############################################
+build_narration_track() {
+    NARRATION_AVAILABLE=false
+    [ "$NARRATION_ENABLED" = "true" ] || return 0
+    [ "${#FACTS[@]}" -eq 0 ] && return 0
+
+    local narr_dir="$ASSET_DIR/narration"
+    rm -rf "$narr_dir"
+    mkdir -p "$narr_dir"
+
+    local list_file="$narr_dir/list.txt"
+    : > "$list_file"
+
+    # Lead-in silence so the stream doesn't open with a voice line
+    # mid-sentence for anyone who joins right at a video transition.
+    if ! ffmpeg -y -f lavfi -i "anullsrc=r=22050:cl=mono" -t "$NARRATION_LEAD_SILENCE" \
+        -c:a pcm_s16le "$narr_dir/000_silence.wav" -loglevel error; then
+        echo "NOTICE: Narration lead-silence generation failed — disabling narration for this video."
+        return 0
+    fi
+    echo "file '$(basename "$narr_dir")/000_silence.wav'" >> "$list_file"
+
+    local i idx raw_wav padded_wav ok=true
+    for i in "${!FACTS[@]}"; do
+        idx=$((i + 1))
+        raw_wav="$narr_dir/raw_${idx}.wav"
+        padded_wav="$narr_dir/${idx}_line.wav"
+
+        if ! echo "${FACTS[$i]}" | "$PIPER_BIN" --model "$PIPER_VOICE" --output_file "$raw_wav" 2>/dev/null; then
+            echo "NOTICE: Piper synthesis failed for fact ${idx} — skipping that line."
+            continue
+        fi
+        if [ ! -s "$raw_wav" ]; then
+            continue
+        fi
+
+        # Pad with trailing silence up to NARRATION_GAP so lines are
+        # evenly spaced; if a line runs longer than the gap it's left
+        # as-is (next line just starts a little later that cycle).
+        if ! ffmpeg -y -i "$raw_wav" -af "apad=whole_dur=${NARRATION_GAP}" \
+            -ar 22050 -ac 1 -c:a pcm_s16le "$padded_wav" -loglevel error; then
+            continue
+        fi
+        echo "file '$(basename "$narr_dir")/${idx}_line.wav'" >> "$list_file"
+        ok=true
+    done
+
+    # Need at least the lead silence + one real line to bother looping.
+    if [ "$(grep -c '^file' "$list_file")" -lt 2 ]; then
+        echo "NOTICE: No narration lines synthesized successfully — narration disabled for this video."
+        return 0
+    fi
+
+    if ! ffmpeg -y -f concat -safe 0 -i "$list_file" -c copy \
+        "$narr_dir/narration_cycle.wav" -loglevel error; then
+        echo "NOTICE: Narration concat failed — narration disabled for this video."
+        return 0
+    fi
+
+    NARRATION_FILE="$narr_dir/narration_cycle.wav"
+    NARRATION_AVAILABLE=true
+    echo "Narration track built: $(grep -c '^file' "$list_file") line(s), looping every ~$(( (${#FACTS[@]} + 0) * NARRATION_GAP ))s"
+}
+
+#############################################
 # prepare_video_content: (re)loads headlines +
 # facts for the video about to stream, and
 # rebuilds BASE_CHAIN / FACT_END to match.
@@ -603,6 +716,8 @@ prepare_video_content() {
         idx=$((i + 1))
         echo "${FACTS[$i]}" | fold -s -w 23 > "$ASSET_DIR/fact${idx}.txt"
     done
+
+    build_narration_track
 
     #########################################
     # Rebuild BASE_CHAIN for this video's content
@@ -852,48 +967,94 @@ run_video() {
     local filter
     filter=$(build_final_filter "$duration")
 
+    # Does this video actually have an audio stream? Determines whether
+    # narration needs to duck existing audio or can just play solo.
+    local has_audio=false
+    if ffprobe -v error -select_streams a -show_entries stream=index \
+        -of csv=p=0 "$url" 2>/dev/null | grep -q .; then
+        has_audio=true
+    fi
+
+    # Build the audio side of the filter graph. Narration input (when
+    # available) always lands at input index 3 — right after video(0),
+    # overlay(1), dot marker(2).
+    local audio_filter map_target
+    if [ "$NARRATION_AVAILABLE" = "true" ]; then
+        if [ "$has_audio" = "true" ]; then
+            # Duck the video's own audio under the narration whenever it
+            # speaks, then mix the two — standard broadcast-style ducking.
+            audio_filter="[3:a]asplit=2[narrsc][narrmix];"
+            audio_filter+="[0:a][narrsc]sidechaincompress=threshold=0.05:ratio=${NARRATION_DUCK_RATIO}:attack=5:release=400[ducked];"
+            audio_filter+="[narrmix]volume=${NARRATION_VOLUME}[narrboost];"
+            audio_filter+="[ducked][narrboost]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+        else
+            # No original audio to duck — just play the narration.
+            audio_filter="[3:a]volume=${NARRATION_VOLUME}[aout]"
+        fi
+        map_target="[aout]"
+    else
+        audio_filter=""
+        map_target="0:a?"
+    fi
+
     while [ "$attempt" -le "$MAX_RETRIES" ]; do
         echo "----------------------------------------"
         echo "Streaming (attempt ${attempt}/${MAX_RETRIES}):"
         echo "$url"
+        [ "$NARRATION_AVAILABLE" = "true" ] && echo "Narration: ON (audio present: ${has_audio})"
         echo "----------------------------------------"
 
+        local -a ff_cmd=(
+            ffmpeg
+            -hide_banner
+            -loglevel info
+            -reconnect 1
+            -reconnect_streamed 1
+            -reconnect_delay_max 5
+            -re
+            -i "$url"
+            -loop 1 -i overlay.png
+            -loop 1 -i "$DOT_MARKER"
+        )
+        if [ "$NARRATION_AVAILABLE" = "true" ]; then
+            ff_cmd+=(-stream_loop -1 -i "$NARRATION_FILE")
+        fi
+
+        local combined_filter="$filter"
+        if [ -n "$audio_filter" ]; then
+            combined_filter="${filter};${audio_filter}"
+        fi
+
+        ff_cmd+=(
+            -filter_complex "$combined_filter"
+            -map "[final]"
+            -map "$map_target"
+            -r 30
+            -s 1280x720
+            -c:v libx264
+            -preset ultrafast
+            -tune zerolatency
+            -threads 2
+            -profile:v high
+            -level 4.1
+            -pix_fmt yuv420p
+            -b:v 3000k
+            -maxrate 3000k
+            -bufsize 6000k
+            -g 60
+            -keyint_min 60
+            -sc_threshold 0
+            -c:a aac
+            -b:a 128k
+            -ar 48000
+            -ac 2
+            -shortest
+            -f flv
+            "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
+        )
+
         set +e
-        ffmpeg \
-        -hide_banner \
-        -loglevel info \
-        -reconnect 1 \
-        -reconnect_streamed 1 \
-        -reconnect_delay_max 5 \
-        -re \
-        -i "$url" \
-        -loop 1 -i overlay.png \
-        -loop 1 -i "$DOT_MARKER" \
-        -filter_complex "$filter" \
-        -map "[final]" \
-        -map 0:a? \
-        -r 30 \
-        -s 1280x720 \
-        -c:v libx264 \
-        -preset ultrafast \
-        -tune zerolatency \
-        -threads 2 \
-        -profile:v high \
-        -level 4.1 \
-        -pix_fmt yuv420p \
-        -b:v 3000k \
-        -maxrate 3000k \
-        -bufsize 6000k \
-        -g 60 \
-        -keyint_min 60 \
-        -sc_threshold 0 \
-        -c:a aac \
-        -b:a 128k \
-        -ar 48000 \
-        -ac 2 \
-        -shortest \
-        -f flv \
-        "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
+        "${ff_cmd[@]}"
         local exit_code=$?
         set -e
 
