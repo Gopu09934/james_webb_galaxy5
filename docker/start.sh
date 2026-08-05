@@ -526,8 +526,8 @@ build_full_filter() {
     done
 
     # ---- Facts section ----
-    F+="[${prev2}]drawbox=x=33:y=278:w=280:h=2:color=${MARS_RED}@0.5:t=fill[fp0];"
-    F+="[fp0]drawbox=x=33:y=284:w=8:h=8:color=${GOLD}:t=fill[fp0b];"
+    F+="[${prev2}]drawbox=x=33:y=282:w=280:h=2:color=${MARS_RED}@0.5:t=fill[fp0];"
+    F+="[fp0]drawbox=x=33:y=289:w=8:h=8:color=${GOLD}:t=fill[fp0b];"
     F+="[fp0b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact_label.txt:fontcolor=${GOLD}@0.90:fontsize=12:x=49:y=290[fp1];"
     local fp_prev="fp1"
     for ((i = 0; i < FACT_N; i++)); do
@@ -536,7 +536,7 @@ build_full_filter() {
         local fend=$((fstart + FACT_SLOT))
         local nxt="f${fidx}"
         local FALPHA="if(between(mod(t\,${FACT_CYCLE})\,${fstart}\,${fend})\,if(lt(mod(t\,${FACT_CYCLE})-${fstart}\,0.5)\,(mod(t\,${FACT_CYCLE})-${fstart})/0.5\,if(gt(mod(t\,${FACT_CYCLE})-${fstart}\,${FACT_SLOT}-0.5)\,(${fend}-mod(t\,${FACT_CYCLE}))/0.5\,1))\,0)"
-        F+="[${fp_prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact${fidx}.txt:fontcolor=white@0.90:fontsize=16:line_spacing=7:x=33:y=306:alpha='${FALPHA}'[${nxt}];"
+        F+="[${fp_prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact${fidx}.txt:fontcolor=white@0.90:fontsize=16:line_spacing=7:x=33:y=318:alpha='${FALPHA}'[${nxt}];"
         fp_prev="$nxt"
     done
 
