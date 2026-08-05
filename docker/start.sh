@@ -568,7 +568,7 @@ build_full_filter() {
     F+="[tk5]drawtext=fontfile=${FONT}:text='MARS LIVE':fontcolor=white:fontsize=14:x=12:y=695[tk6];"
 
     # ---- Watermark ----
-    F+="[tk6]drawtext=fontfile=${FONT}:text='${CHANNEL_NAME}':fontcolor=white@0.40:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=353:y=600[wm1];"
+    F+="[tk6]drawtext=fontfile=${FONT}:text='${CHANNEL_NAME}':fontcolor=white@0.40:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=353:y=655[wm1];"
 
     # ---- Pulsing subscribe ring ----
     local SUB_PULSE_ENABLE="lt(mod(t\,3)\,1)"
