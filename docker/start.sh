@@ -528,7 +528,7 @@ build_full_filter() {
     # ---- Facts section ----
     F+="[${prev2}]drawbox=x=33:y=278:w=280:h=2:color=${MARS_RED}@0.5:t=fill[fp0];"
     F+="[fp0]drawbox=x=33:y=284:w=8:h=8:color=${GOLD}:t=fill[fp0b];"
-    F+="[fp0b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact_label.txt:fontcolor=${GOLD}@0.90:fontsize=12:x=49:y=282[fp1];"
+    F+="[fp0b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact_label.txt:fontcolor=${GOLD}@0.90:fontsize=12:x=49:y=290[fp1];"
     local fp_prev="fp1"
     for ((i = 0; i < FACT_N; i++)); do
         local fidx=$((i + 1))
