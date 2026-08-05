@@ -67,7 +67,6 @@ jobs:
       - name: Start Mars Live Stream
         run: |
           docker run \
-            -e NASA_API_KEY="${{ secrets.NASA_API_KEY }}" \
             -e YOUTUBE_STREAM_KEY="${{ secrets.YOUTUBE_STREAM_KEY }}" \
             -e YOUTUBE_API_KEY="${{ secrets.YOUTUBE_API_KEY }}" \
             -e YOUTUBE_CHANNEL_ID="${{ secrets.YOUTUBE_CHANNEL_ID }}" \
