@@ -602,9 +602,9 @@ run_stream() {
         -loglevel info \
         -f concat -safe 0 -i "$ASSET_DIR/concat_list.txt" \
         -loop 1 -i overlay.png \
+        -f lavfi -i anullsrc=r=48000:cl=stereo \
         -filter_complex "$filter" \
         -map "[final]" \
-        -f lavfi -i anullsrc=r=48000:cl=stereo \
         -map 2:a \
         -r 30 \
         -s 1280x720 \
