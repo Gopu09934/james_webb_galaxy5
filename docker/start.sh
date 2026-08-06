@@ -68,7 +68,7 @@ CHANNEL_NAME="Technical Talk india"
 SHADOW="shadowcolor=black@0.6:shadowx=1:shadowy=1"
 INFO_FONTSIZE=19
 INFO_LINE_SPACING=8
-MAX_IMAGES=301
+MAX_IMAGES=80              # lowered from 301 — 300 simultaneous zoompans/xfades was too heavy for real-time CPU encoding (was rendering at ~0.46x speed)
 PAGE_SIZE=100              # FIX 1: server caps per-request at ~100, we paginate
 VIEWER_MIN_TO_SHOW=10
 
@@ -80,17 +80,18 @@ MAX_RETRIES=5
 RETRY_DELAY=5
 
 # --- Ken Burns / transition settings (documentary style) ---
-# NOTE ON PERFORMANCE: with MAX_IMAGES=301, a full cycle builds ~301
-# zoompans + ~300 xfades in ONE filter graph. That's heavy on -preset
-# ultrafast. If you see the stream stutter/lag, lower MAX_IMAGES (e.g.
-# 40-80) rather than changing anything below.
-ZOOM_FPS=30                 # frame rate for the zoom/pan + transition render (matches stream fps)
+# NOTE ON PERFORMANCE: each image adds one zoompan + one xfade to a
+# single filter graph, all rendered on CPU. That's the actual
+# real-time bottleneck (not the encoder preset). If the stream is
+# still stuttering/lagging behind at MAX_IMAGES=80, lower it further
+# (e.g. 40-60) before touching anything else.
+ZOOM_FPS=24                 # lowered from 30 — cuts zoompan frame-render cost by ~20% with barely visible smoothness difference
 XFADE_DUR=1                 # seconds of crossfade/wipe between consecutive images (kept as an integer to keep bash math simple)
 ZOOM_MAX=1.5                # max zoom factor for the Ken Burns effect
 ZOOM_STEP=0.0015            # per-frame zoom increment/decrement
-KB_SCALE_W=1600             # oversized canvas so pan/zoom has headroom without ever showing black edges
-KB_SCALE_H=900
-TRANSITIONS=(fade dissolve wipeleft wiperight slideleft slideright smoothleft smoothright circleopen circleclose)
+KB_SCALE_W=1400             # lowered from 1600 — smaller oversized canvas = cheaper scale/crop/zoompan per frame, still enough headroom for the pan drift below
+KB_SCALE_H=788
+TRANSITIONS=(fade dissolve wipeleft wiperight slideleft slideright smoothleft smoothright)  # dropped circleopen/circleclose — the circular mask math is the most expensive transition type
 
 # --- Background music (loops for the whole stream) ---
 MUSIC_URL="${MUSIC_URL:-}"          # set this as a secret/env var with a direct audio file URL to enable music
@@ -576,7 +577,7 @@ build_slide_info_chain() {
         local ALPHA="if(between(mod(t\,${CYCLE})\,${start}\,${end})\,if(lt(mod(t\,${CYCLE})-${start}\,0.5)\,(mod(t\,${CYCLE})-${start})/0.5\,if(gt(mod(t\,${CYCLE})-${start}\,${SLIDE_DURATION}-0.5)\,(${end}-mod(t\,${CYCLE}))/0.5\,1))\,0)"
 
         local nxt="si${idx}"
-        chain+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/slide_info${idx}.txt:fontcolor=white:fontsize=${INFO_FONTSIZE}:line_spacing=${INFO_LINE_SPACING}:x=375:y=560:alpha='${ALPHA}':${SHADOW}[${nxt}];"
+        chain+="[${prev}]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/slide_info${idx}.txt:fontcolor=white:fontsize=${INFO_FONTSIZE}:line_spacing=${INFO_LINE_SPACING}:x=375:y=560:alpha='${ALPHA}':${SHADOW}[${nxt}];"
         prev="$nxt"
     done
 
@@ -686,23 +687,23 @@ build_full_filter() {
     F+="[p5]drawbox=x=345:y=0:w=2:h=720:color=${MARS_RED}@0.6:t=fill[p6];"
 
     F+="[p6]drawbox=x=27:y=28:w=11:h=11:color=${RED}:t=fill:enable='lt(mod(t\,1)\,0.6)'[p7];"
-    F+="[p7]drawtext=fontfile=${FONT}:text='LIVE':fontcolor=white:fontsize=30:x=44:y=19[p8];"
+    F+="[p7]drawtext=fontfile=${FONT}:expansion=none:text='LIVE':fontcolor=white:fontsize=30:x=44:y=19[p8];"
 
-    F+="[p8]drawtext=fontfile=${FONT}:text='Credits\: NASA/JPL-Caltech':fontcolor=white@0.85:fontsize=13:x=313-text_w:y=19[p9];"
-    F+="[p9]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/clock.txt:reload=1:fontcolor=${GOLD}:fontsize=13:x=313-text_w:y=37[p10];"
-    F+="[p10]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/subs.txt:reload=1:fontcolor=white@0.75:fontsize=12:x=313-text_w:y=55[p10b];"
-    F+="[p10b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/viewers.txt:reload=1:fontcolor=white@0.75:fontsize=12:x=313-text_w:y=72[p10c];"
+    F+="[p8]drawtext=fontfile=${FONT}:expansion=none:text='Credits\: NASA/JPL-Caltech':fontcolor=white@0.85:fontsize=13:x=313-text_w:y=19[p9];"
+    F+="[p9]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/clock.txt:reload=1:fontcolor=${GOLD}:fontsize=13:x=313-text_w:y=37[p10];"
+    F+="[p10]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/subs.txt:reload=1:fontcolor=white@0.75:fontsize=12:x=313-text_w:y=55[p10b];"
+    F+="[p10b]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/viewers.txt:reload=1:fontcolor=white@0.75:fontsize=12:x=313-text_w:y=72[p10c];"
 
-    F+="[p10c]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/title1.txt:fontcolor=${MARS_RED}:fontsize=26:x=33:y=95:${SHADOW}[p11];"
-    F+="[p11]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/title2.txt:fontcolor=white@0.90:fontsize=15:x=33:y=127:${SHADOW}[p12];"
+    F+="[p10c]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/title1.txt:fontcolor=${MARS_RED}:fontsize=26:x=33:y=95:${SHADOW}[p11];"
+    F+="[p11]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/title2.txt:fontcolor=white@0.90:fontsize=15:x=33:y=127:${SHADOW}[p12];"
     F+="[p12]drawbox=x=33:y=157:w=280:h=2:color=white@0.3:t=fill[p13];"
 
     F+="[p13]drawbox=x=33:y=171:w=10:h=10:color=${MARS_RED}:t=fill[p14];"
-    F+="[p14]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/header.txt:fontcolor=${GOLD}:fontsize=14:x=50:y=169[p15];"
-    F+="[p15]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/eyebrow.txt:fontcolor=${MARS_RED}@0.90:fontsize=12:x=33:y=198[p16];"
+    F+="[p14]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/header.txt:fontcolor=${GOLD}:fontsize=14:x=50:y=169[p15];"
+    F+="[p15]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/eyebrow.txt:fontcolor=${MARS_RED}@0.90:fontsize=12:x=33:y=198[p16];"
 
     local SLIDE_CYCLE=$((n_slides * SLIDE_DURATION))
-    F+="[p16]drawtext=fontfile=${FONT}:text='IMAGE GALLERY':fontcolor=white@0.35:fontsize=9:x=33:y=225[pgcap];"
+    F+="[p16]drawtext=fontfile=${FONT}:expansion=none:text='IMAGE GALLERY':fontcolor=white@0.35:fontsize=9:x=33:y=225[pgcap];"
     F+="[pgcap]drawbox=x=33:y=238:w=280:h=3:color=white@0.15:t=fill[pg1];"
     F+="[pg1]drawbox=x=33:y=238:w='280*(mod(t\,${SLIDE_DURATION}))/${SLIDE_DURATION}':h=3:color=${MARS_RED}:t=fill[pg2];"
 
@@ -727,7 +728,7 @@ build_full_filter() {
 
     F+="[${prev2}]drawbox=x=33:y=282:w=280:h=2:color=${MARS_RED}@0.5:t=fill[fp0];"
     F+="[fp0]drawbox=x=33:y=289:w=8:h=8:color=${GOLD}:t=fill[fp0b];"
-    F+="[fp0b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact_label.txt:fontcolor=${GOLD}@0.90:fontsize=12:x=49:y=290[fp1];"
+    F+="[fp0b]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/fact_label.txt:fontcolor=${GOLD}@0.90:fontsize=12:x=49:y=290[fp1];"
     local fp_prev="fp1"
     for ((i = 0; i < FACT_N; i++)); do
         local fidx=$((i + 1))
@@ -735,35 +736,35 @@ build_full_filter() {
         local fend=$((fstart + FACT_SLOT))
         local nxt="f${fidx}"
         local FALPHA="if(between(mod(t\,${FACT_CYCLE})\,${fstart}\,${fend})\,if(lt(mod(t\,${FACT_CYCLE})-${fstart}\,0.5)\,(mod(t\,${FACT_CYCLE})-${fstart})/0.5\,if(gt(mod(t\,${FACT_CYCLE})-${fstart}\,${FACT_SLOT}-0.5)\,(${fend}-mod(t\,${FACT_CYCLE}))/0.5\,1))\,0)"
-        F+="[${fp_prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact${fidx}.txt:fontcolor=white@0.90:fontsize=16:line_spacing=7:x=33:y=318:alpha='${FALPHA}'[${nxt}];"
+        F+="[${fp_prev}]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/fact${fidx}.txt:fontcolor=white@0.90:fontsize=16:line_spacing=7:x=33:y=318:alpha='${FALPHA}'[${nxt}];"
         fp_prev="$nxt"
     done
 
     F+="[${fp_prev}]drawbox=x=10:y=560:w=326:h=115:color=black@0.55:t=fill[mi0];"
     F+="[mi0]drawbox=x=10:y=560:w=5:h=115:color=${MARS_RED}:t=fill[mi1];"
-    F+="[mi1]drawtext=fontfile=${FONT}:text='MISSION STATS':fontcolor=${GOLD}:fontsize=11:x=22:y=567[mi2];"
-    F+="[mi2]drawtext=fontfile=${FONT}:text='Rover\: Perseverance (Percy)':fontcolor=white@0.85:fontsize=13:x=22:y=585[mi3];"
-    F+="[mi3]drawtext=fontfile=${FONT}:text='Landing\: Feb 18\, 2021':fontcolor=white@0.85:fontsize=13:x=22:y=602[mi4];"
-    F+="[mi4]drawtext=fontfile=${FONT}:text='Location\: Jezero Crater':fontcolor=white@0.85:fontsize=13:x=22:y=619[mi5];"
-    F+="[mi5]drawtext=fontfile=${FONT}:text='Sol\: ${CURRENT_SOL}':fontcolor=${MARS_RED}:fontsize=15:x=22:y=638[mi6];"
-    F+="[mi6]drawtext=fontfile=${FONT}:text='Images\: ${DOWNLOAD_COUNT} captured today':fontcolor=white@0.75:fontsize=12:x=22:y=659[mi7];"
+    F+="[mi1]drawtext=fontfile=${FONT}:expansion=none:text='MISSION STATS':fontcolor=${GOLD}:fontsize=11:x=22:y=567[mi2];"
+    F+="[mi2]drawtext=fontfile=${FONT}:expansion=none:text='Rover\: Perseverance (Percy)':fontcolor=white@0.85:fontsize=13:x=22:y=585[mi3];"
+    F+="[mi3]drawtext=fontfile=${FONT}:expansion=none:text='Landing\: Feb 18\, 2021':fontcolor=white@0.85:fontsize=13:x=22:y=602[mi4];"
+    F+="[mi4]drawtext=fontfile=${FONT}:expansion=none:text='Location\: Jezero Crater':fontcolor=white@0.85:fontsize=13:x=22:y=619[mi5];"
+    F+="[mi5]drawtext=fontfile=${FONT}:expansion=none:text='Sol\: ${CURRENT_SOL}':fontcolor=${MARS_RED}:fontsize=15:x=22:y=638[mi6];"
+    F+="[mi6]drawtext=fontfile=${FONT}:expansion=none:text='Images\: ${DOWNLOAD_COUNT} captured today':fontcolor=white@0.75:fontsize=12:x=22:y=659[mi7];"
 
     local CTA_ALPHA="if(between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})\,if(lt(mod(t\,${CTA_CYCLE})\,0.5)\,mod(t\,${CTA_CYCLE})/0.5\,if(gt(mod(t\,${CTA_CYCLE})\,${CTA_SHOW}-0.5)\,(${CTA_SHOW}-mod(t\,${CTA_CYCLE}))/0.5\,1))\,0)"
     local CTA_ENABLE="between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})"
     F+="[mi7]drawbox=x=733:y=620:w=507:h=43:color=black@0.75:t=fill[cta_bg];"
     F+="[cta_bg]drawbox=x=733:y=620:w=4:h=43:color=${MARS_RED}:t=fill[cta_bar];"
     F+="[cta_bar]drawbox=x=755:y=636:w=11:h=11:color=${RED}:t=fill:enable='${CTA_ENABLE}'[cta_dot];"
-    F+="[cta_dot]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/cta.txt:fontcolor=white:fontsize=19:x=773:y=633:alpha='${CTA_ALPHA}'[cta_sub];"
-    F+="[cta_sub]drawtext=fontfile=${FONT}:text='Images refresh each Sol':fontcolor=white@0.80:fontsize=19:x=773:y=633:enable='not(${CTA_ENABLE})'[cta_final];"
+    F+="[cta_dot]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/cta.txt:fontcolor=white:fontsize=19:x=773:y=633:alpha='${CTA_ALPHA}'[cta_sub];"
+    F+="[cta_sub]drawtext=fontfile=${FONT}:expansion=none:text='Images refresh each Sol':fontcolor=white@0.80:fontsize=19:x=773:y=633:enable='not(${CTA_ENABLE})'[cta_final];"
 
     F+="[cta_final]drawbox=x=0:y=680:w=1280:h=40:color=black@0.72:t=fill[tk1];"
     F+="[tk1]drawbox=x=0:y=680:w=1280:h=2:color=${MARS_RED}@0.9:t=fill[tk2];"
-    F+="[tk2]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/ticker.txt:fontcolor=white:fontsize=17:borderw=2:bordercolor=black@0.6:y=695:x='w-mod(t*${TICKER_SPEED}\,text_w+w)'[tk3];"
+    F+="[tk2]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/ticker.txt:fontcolor=white:fontsize=17:borderw=2:bordercolor=black@0.6:y=695:x='w-mod(t*${TICKER_SPEED}\,text_w+w)'[tk3];"
     F+="[tk3]drawbox=x=0:y=680:w=130:h=40:color=black@0.85:t=fill[tk4];"
     F+="[tk4]drawbox=x=0:y=682:w=123:h=38:color=${MARS_RED}:t=fill[tk5];"
-    F+="[tk5]drawtext=fontfile=${FONT}:text='MARS LIVE':fontcolor=white:fontsize=14:x=12:y=695[tk6];"
+    F+="[tk5]drawtext=fontfile=${FONT}:expansion=none:text='MARS LIVE':fontcolor=white:fontsize=14:x=12:y=695[tk6];"
 
-    F+="[tk6]drawtext=fontfile=${FONT}:text='${CHANNEL_NAME}':fontcolor=white@0.40:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=353:y=655[wm1];"
+    F+="[tk6]drawtext=fontfile=${FONT}:expansion=none:text='${CHANNEL_NAME}':fontcolor=white@0.40:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=353:y=655[wm1];"
 
     local SUB_PULSE_ENABLE="lt(mod(t\,3)\,1)"
     local sub_ring_x=$((SUB_ICON_X - SUB_ICON_R))
