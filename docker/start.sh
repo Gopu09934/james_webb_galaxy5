@@ -641,7 +641,9 @@ build_slide_info_chain() {
             "$CURRENT_SOL" "$idx" "$n" "$cam" \
             > "$ASSET_DIR/slide_info${idx}.txt"
         if [ -n "$edate" ]; then
-            printf '\nEarth Date\: %s' "$edate" >> "$ASSET_DIR/slide_info${idx}.txt"
+            local edate_short="${edate:0:16}"
+            edate_short="${edate_short/T/ }"
+            printf '\nEarth Date: %s UTC' "$edate_short" >> "$ASSET_DIR/slide_info${idx}.txt"
         fi
 
         local ENABLE="between(mod(t\,${CYCLE})\,${start}\,${end})"
@@ -653,12 +655,12 @@ build_slide_info_chain() {
         # to disappear. The card snaps on/off (fine, since the text
         # drawn on top of it still fades smoothly via ALPHA).
         local box="sib${idx}"
-        chain+="[${prev}]drawbox=x=365:y=548:w=545:h=118:color=black@0.55:t=fill:enable='${ENABLE}'[${box}];"
+        chain+="[${prev}]drawbox=x=365:y=548:w=350:h=118:color=black@0.55:t=fill:enable='${ENABLE}'[${box}];"
         local barlbl="sil${idx}"
         chain+="[${box}]drawbox=x=365:y=548:w=4:h=118:color=${MARS_RED}:t=fill:enable='${ENABLE}'[${barlbl}];"
 
         local nxt="si${idx}"
-        chain+="[${barlbl}]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/slide_info${idx}.txt:fontcolor=white:fontsize=17:line_spacing=7:x=385:y=560:alpha='${ALPHA}':borderw=1.5:bordercolor=black@0.85:${SHADOW}[${nxt}];"
+        chain+="[${barlbl}]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/slide_info${idx}.txt:fontcolor=white:fontsize=15:line_spacing=7:x=385:y=560:alpha='${ALPHA}':borderw=1.5:bordercolor=black@0.85:${SHADOW}[${nxt}];"
         prev="$nxt"
     done
 
