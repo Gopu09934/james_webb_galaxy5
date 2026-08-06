@@ -611,8 +611,14 @@ build_slideshow_filter() {
         fi
     done
 
+    # Documentary-style grading on the raw NASA photos themselves —
+    # brightened/punched up here (not on the final composite) so the
+    # left info panel's contrast never depends on how bright/washed-out
+    # a given Mars sky frame happens to be.
+    chain+="[${prev}]eq=brightness=0.06:contrast=1.18:saturation=1.15:gamma=1.04[${prev}_graded];"
+
     SLIDESHOW_FILTER="$chain"
-    SLIDESHOW_LABEL="$prev"
+    SLIDESHOW_LABEL="${prev}_graded"
 }
 
 #############################################
@@ -631,16 +637,28 @@ build_slide_info_chain() {
         local cam="${CAMERA_NAMES[$i]:-Unknown Camera}"
         local edate="${EARTH_DATES[$i]:-}"
 
-        printf 'SOL %s  •  IMAGE %d/%d\n%s' "$CURRENT_SOL" "$idx" "$n" "$cam" \
+        printf 'TRANSMISSION FROM MARS\nSol %s  ·  Frame %d of %d\n%s' \
+            "$CURRENT_SOL" "$idx" "$n" "$cam" \
             > "$ASSET_DIR/slide_info${idx}.txt"
         if [ -n "$edate" ]; then
-            printf '\nEarth Date: %s' "$edate" >> "$ASSET_DIR/slide_info${idx}.txt"
+            printf '\nEarth Date\: %s' "$edate" >> "$ASSET_DIR/slide_info${idx}.txt"
         fi
 
+        local ENABLE="between(mod(t\,${CYCLE})\,${start}\,${end})"
         local ALPHA="if(between(mod(t\,${CYCLE})\,${start}\,${end})\,if(lt(mod(t\,${CYCLE})-${start}\,0.5)\,(mod(t\,${CYCLE})-${start})/0.5\,if(gt(mod(t\,${CYCLE})-${start}\,${SLIDE_DURATION}-0.5)\,(${end}-mod(t\,${CYCLE}))/0.5\,1))\,0)"
 
+        # Solid lower-third card behind the caption — this is what
+        # actually fixes readability over bright/washed-out sky
+        # frames, where plain white text with just a drop shadow used
+        # to disappear. The card snaps on/off (fine, since the text
+        # drawn on top of it still fades smoothly via ALPHA).
+        local box="sib${idx}"
+        chain+="[${prev}]drawbox=x=365:y=548:w=545:h=118:color=black@0.55:t=fill:enable='${ENABLE}'[${box}];"
+        local barlbl="sil${idx}"
+        chain+="[${box}]drawbox=x=365:y=548:w=4:h=118:color=${MARS_RED}:t=fill:enable='${ENABLE}'[${barlbl}];"
+
         local nxt="si${idx}"
-        chain+="[${prev}]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/slide_info${idx}.txt:fontcolor=white:fontsize=${INFO_FONTSIZE}:line_spacing=${INFO_LINE_SPACING}:x=375:y=560:alpha='${ALPHA}':${SHADOW}[${nxt}];"
+        chain+="[${barlbl}]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/slide_info${idx}.txt:fontcolor=white:fontsize=17:line_spacing=7:x=385:y=560:alpha='${ALPHA}':borderw=1.5:bordercolor=black@0.85:${SHADOW}[${nxt}];"
         prev="$nxt"
     done
 
@@ -742,7 +760,7 @@ build_full_filter() {
     F+="$SLIDE_INFO_CHAIN"
     local prev="$SLIDE_INFO_END"
 
-    F+="[${prev}]drawbox=x=0:y=0:w=333:h=720:color=black@0.50:t=fill[p1];"
+    F+="[${prev}]drawbox=x=0:y=0:w=333:h=720:color=0x05080C@0.72:t=fill[p1];"
     F+="[p1]drawbox=x=333:y=0:w=4:h=720:color=black@0.45:t=fill[p2];"
     F+="[p2]drawbox=x=337:y=0:w=4:h=720:color=black@0.30:t=fill[p3];"
     F+="[p3]drawbox=x=341:y=0:w=4:h=720:color=black@0.15:t=fill[p4];"
@@ -867,7 +885,8 @@ build_full_filter() {
     F+="[tk4]drawbox=x=0:y=682:w=123:h=38:color=${MARS_RED}:t=fill[tk5];"
     F+="[tk5]drawtext=fontfile=${FONT}:expansion=none:text='MARS LIVE':fontcolor=white:fontsize=14:x=12:y=695[tk6];"
 
-    F+="[tk6]drawtext=fontfile=${FONT}:expansion=none:text='${CHANNEL_NAME}':fontcolor=white@0.40:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=353:y=655[wm1];"
+    F+="[tk6]drawbox=x=345:y=648:w=360:h=20:color=black@0.30:t=fill[wmbg];"
+    F+="[wmbg]drawtext=fontfile=${FONT}:expansion=none:text='${CHANNEL_NAME}':fontcolor=white@0.55:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=353:y=655[wm1];"
 
     local SUB_PULSE_ENABLE="lt(mod(t\,3)\,1)"
     local sub_ring_x=$((SUB_ICON_X - SUB_ICON_R))
@@ -875,8 +894,7 @@ build_full_filter() {
     local sub_ring_d=$((SUB_ICON_R * 2))
     F+="[wm1]drawbox=x=${sub_ring_x}:y=${sub_ring_y}:w=${sub_ring_d}:h=${sub_ring_d}:color=${GOLD}@0.9:t=3:enable='${SUB_PULSE_ENABLE}'[wm2];"
 
-    F+="[wm2]drawbox=x=0:y=0:w=1280:h=720:color=black@0.5:t=2[vignette];"
-    F+="[vignette]eq=brightness=0.08:contrast=1.12:saturation=1.05[final]"
+    F+="[wm2]drawbox=x=0:y=0:w=1280:h=720:color=black@0.5:t=2[final]"
 
     echo "$F"
 }
