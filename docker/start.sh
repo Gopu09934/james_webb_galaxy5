@@ -799,6 +799,14 @@ run_stream() {
     local filter
     filter=$(build_full_filter "$n_slides")
 
+    # With ~300 images the filter graph (zoompans + xfades + overlay text)
+    # can easily exceed the OS's ~128KB single-argument limit, causing
+    # ffmpeg to fail immediately with "Argument list too long" (E2BIG).
+    # Writing it to a file and using -filter_complex_script avoids that
+    # entirely, since only a short file path goes on the command line.
+    local filter_script="$ASSET_DIR/filter_complex.txt"
+    printf '%s' "$filter" > "$filter_script"
+
     # Each image is its own ffmpeg input (index 0..n-1) so it can get its
     # own Ken Burns zoompan before being cross-faded into the next one.
     local INPUT_ARGS=()
@@ -823,7 +831,7 @@ run_stream() {
         -hide_banner \
         -loglevel info \
         "${INPUT_ARGS[@]}" \
-        -filter_complex "$filter" \
+        -filter_complex_script "$filter_script" \
         -map "[final]" \
         -map "${AUDIO_INPUT_IDX}:a" \
         -r 30 \
