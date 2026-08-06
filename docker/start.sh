@@ -6,13 +6,28 @@ set -euo pipefail
 # Fetches latest Sol images from NASA and
 # streams a slideshow to YouTube with overlay.
 #
-# FIXES:
-#   1. Image fetching now paginates (100/page)
-#      to get up to MAX_IMAGES total images.
+# FIXES (previous):
+#   1. Image fetching paginates (100/page) to
+#      get up to MAX_IMAGES total images.
 #   2. Each downloaded file is validated via
 #      magic bytes + ffprobe before being added
 #      to the slideshow — prevents "stuck frame"
 #      caused by corrupt/HTML error downloads.
+#
+# NEW:
+#   3. Looping background music. Set MUSIC_URL
+#      (as a secret/env var) to an audio file
+#      URL (mp3/aac/m4a/wav...). It is downloaded
+#      once, then looped continuously (-stream_loop
+#      -1) as the stream's audio track. If unset
+#      or invalid, falls back to silent audio like
+#      before — nothing breaks.
+#   4. Documentary-style slideshow: every image
+#      now gets its own slow zoom/pan (Ken Burns)
+#      via zoompan, and consecutive images are
+#      blended together with a crossfade/wipe
+#      transition (xfade) instead of a hard cut,
+#      cycling through several transition styles.
 #############################################
 
 #############################################
@@ -63,6 +78,24 @@ SUB_ICON_R=20
 
 MAX_RETRIES=5
 RETRY_DELAY=5
+
+# --- Ken Burns / transition settings (documentary style) ---
+# NOTE ON PERFORMANCE: with MAX_IMAGES=301, a full cycle builds ~301
+# zoompans + ~300 xfades in ONE filter graph. That's heavy on -preset
+# ultrafast. If you see the stream stutter/lag, lower MAX_IMAGES (e.g.
+# 40-80) rather than changing anything below.
+ZOOM_FPS=30                 # frame rate for the zoom/pan + transition render (matches stream fps)
+XFADE_DUR=1                 # seconds of crossfade/wipe between consecutive images (kept as an integer to keep bash math simple)
+ZOOM_MAX=1.5                # max zoom factor for the Ken Burns effect
+ZOOM_STEP=0.0015            # per-frame zoom increment/decrement
+KB_SCALE_W=1600             # oversized canvas so pan/zoom has headroom without ever showing black edges
+KB_SCALE_H=900
+TRANSITIONS=(fade dissolve wipeleft wiperight slideleft slideright smoothleft smoothright circleopen circleclose)
+
+# --- Background music (loops for the whole stream) ---
+MUSIC_URL="${MUSIC_URL:-}"          # set this as a secret/env var with a direct audio file URL to enable music
+MUSIC_FILE="$ASSET_DIR/bgm_audio"
+HAVE_MUSIC=false
 
 mkdir -p "$ASSET_DIR" "$IMAGES_DIR"
 
@@ -127,6 +160,39 @@ MARS_HEADLINES=(
     "Ancient delta deposits in Jezero hint at a watery Martian past."
     "Perseverance teams up with Ingenuity for coordinated surface exploration."
 )
+
+#############################################
+# Prepare looping background music (once)
+#############################################
+prepare_music() {
+    if [ -z "$MUSIC_URL" ]; then
+        echo "NOTICE: MUSIC_URL not set — streaming with silent audio track."
+        return
+    fi
+
+    echo "----------------------------------------"
+    echo "Downloading background music from MUSIC_URL..."
+    echo "----------------------------------------"
+
+    local attempt=1
+    while [ "$attempt" -le 3 ]; do
+        if curl -sSL --max-time 60 -o "$MUSIC_FILE" "$MUSIC_URL"; then
+            if [ -s "$MUSIC_FILE" ] && ffprobe -v error -select_streams a:0 \
+                -show_entries stream=codec_type -of csv=p=0 "$MUSIC_FILE" 2>/dev/null | grep -q audio; then
+                echo "Music downloaded and validated: $MUSIC_FILE"
+                HAVE_MUSIC=true
+                return
+            fi
+        fi
+        echo "  Music download/validation failed (attempt ${attempt}/3), retrying..."
+        rm -f "$MUSIC_FILE"
+        attempt=$((attempt + 1))
+        sleep 3
+    done
+
+    echo "WARNING: Could not fetch valid audio from MUSIC_URL — falling back to silent audio."
+    HAVE_MUSIC=false
+}
 
 #############################################
 # FIX 1: fetch_mars_images — PAGINATED
@@ -293,12 +359,10 @@ fetch_mars_images() {
 #############################################
 # FIX 2: download_images — HTTP + JPEG validation
 #
-# Old code only checked curl exit code and file
-# size. NASA CDN sometimes returns HTML error
-# pages (200 OK, non-empty, but not a JPEG).
-# ffmpeg then hits this "jpg", can't decode it,
-# and freezes on the last good frame — causing
-# the "stuck image" symptom.
+# NASA CDN sometimes returns HTML error pages
+# (200 OK, non-empty, but not a JPEG). ffmpeg
+# then hits this "jpg", can't decode it, and
+# freezes on the last good frame.
 #
 # Now we check:
 #   a) HTTP status must be 200
@@ -395,25 +459,96 @@ write_panel_assets() {
 }
 
 #############################################
-# Build ffmpeg concat list for images
+# Collect sorted list of downloaded image files
+# (replaces the old concat-list builder — each
+# image is now its own ffmpeg input so it can
+# get its own Ken Burns zoom/pan)
 #############################################
-build_concat_list() {
-    local list_file="$ASSET_DIR/concat_list.txt"
-    rm -f "$list_file"
-    local count=0
-    for f in "$IMAGES_DIR"/mars_sol*.jpg; do
-        [ -f "$f" ] || continue
-        echo "file '$(realpath "$f")'" >> "$list_file"
-        echo "duration $SLIDE_DURATION"  >> "$list_file"
-        count=$((count + 1))
+build_image_array() {
+    IMAGE_FILES=()
+    while IFS= read -r f; do
+        IMAGE_FILES+=("$f")
+    done < <(ls "$IMAGES_DIR"/mars_sol*.jpg 2>/dev/null | sort)
+    echo "Image array built: ${#IMAGE_FILES[@]} slides for Sol $CURRENT_SOL"
+}
+
+#############################################
+# NEW: Ken Burns + crossfade slideshow chain
+#
+# Every image gets a slow zoom/pan (zoompan),
+# then consecutive slides are stitched with an
+# xfade transition (fade/dissolve/wipe/slide/
+# circle — rotated from TRANSITIONS) instead of
+# a hard cut.
+#
+# Timing trick: every clip except the last is
+# rendered for SLIDE_DURATION + XFADE_DUR
+# seconds. xfade "eats" that extra XFADE_DUR
+# tail to do the transition, so slide boundaries
+# in the merged output still land on exact
+# multiples of SLIDE_DURATION — which means
+# build_slide_info_chain() below (captions, the
+# progress bar, the dot indicators) needs no
+# changes at all to stay in sync.
+#############################################
+build_slideshow_filter() {
+    local n="$1"
+    local chain=""
+    local prev=""
+
+    for ((i = 0; i < n; i++)); do
+        local is_last=0
+        [ "$i" -eq $((n - 1)) ] && is_last=1
+
+        local dur=$SLIDE_DURATION
+        [ "$is_last" -eq 0 ] && dur=$((SLIDE_DURATION + XFADE_DUR))
+        local frames=$((dur * ZOOM_FPS))
+
+        # Alternate 4 Ken Burns variants for visual variety
+        local variant=$((i % 4))
+        local z x y
+        case "$variant" in
+            0) # slow zoom-in, centered
+                z="min(zoom+${ZOOM_STEP}\,${ZOOM_MAX})"
+                x="iw/2-(iw/zoom/2)"
+                y="ih/2-(ih/zoom/2)"
+                ;;
+            1) # slow zoom-out, centered
+                z="if(eq(on\,1)\,${ZOOM_MAX}\,max(1.001\,zoom-${ZOOM_STEP}))"
+                x="iw/2-(iw/zoom/2)"
+                y="ih/2-(ih/zoom/2)"
+                ;;
+            2) # zoom-in, drifting toward top-right
+                z="min(zoom+${ZOOM_STEP}\,${ZOOM_MAX})"
+                x="iw/2-(iw/zoom/2)+(on*0.35)"
+                y="ih/2-(ih/zoom/2)-(on*0.20)"
+                ;;
+            3) # zoom-in, drifting toward bottom-left
+                z="min(zoom+${ZOOM_STEP}\,${ZOOM_MAX})"
+                x="iw/2-(iw/zoom/2)-(on*0.35)"
+                y="ih/2-(ih/zoom/2)+(on*0.20)"
+                ;;
+        esac
+
+        local label="img${i}"
+        chain+="[${i}:v]scale=${KB_SCALE_W}:${KB_SCALE_H}:force_original_aspect_ratio=increase,"
+        chain+="crop=${KB_SCALE_W}:${KB_SCALE_H},"
+        chain+="zoompan=z='${z}':x='${x}':y='${y}':d=${frames}:s=1280x720:fps=${ZOOM_FPS},"
+        chain+="format=yuv420p,setsar=1[${label}];"
+
+        if [ "$i" -eq 0 ]; then
+            prev="$label"
+        else
+            local transition="${TRANSITIONS[$(( (i - 1) % ${#TRANSITIONS[@]} ))]}"
+            local offset=$((i * SLIDE_DURATION))
+            local nxt="xf${i}"
+            chain+="[${prev}][${label}]xfade=transition=${transition}:duration=${XFADE_DUR}:offset=${offset}[${nxt}];"
+            prev="$nxt"
+        fi
     done
-    local last_f
-    last_f=$(ls "$IMAGES_DIR"/mars_sol*.jpg 2>/dev/null | tail -1)
-    if [ -n "$last_f" ]; then
-        echo "file '$(realpath "$last_f")'" >> "$list_file"
-    fi
-    TOTAL_SLIDE_DURATION=$((count * SLIDE_DURATION))
-    echo "Concat list: $count slides × ${SLIDE_DURATION}s = ${TOTAL_SLIDE_DURATION}s total"
+
+    SLIDESHOW_FILTER="$chain"
+    SLIDESHOW_LABEL="$prev"
 }
 
 #############################################
@@ -532,11 +667,12 @@ build_full_filter() {
     local CTA_CYCLE=180
     local CTA_SHOW=8
 
+    build_slideshow_filter "$n_slides"
+
     local F=""
-    F+="[0:v]scale=1280:720:force_original_aspect_ratio=decrease,"
-    F+="pad=1280:720:(ow-iw)/2:(oh-ih)/2:black[video];"
-    F+="[1:v]scale=1280:720:flags=fast_bilinear[ovl];"
-    F+="[ovl][video]overlay=0:0[base];"
+    F+="$SLIDESHOW_FILTER"
+    F+="[${OVERLAY_INPUT_IDX}:v]scale=1280:720:flags=fast_bilinear[ovl];"
+    F+="[ovl][${SLIDESHOW_LABEL}]overlay=0:0[base];"
 
     build_slide_info_chain "$n_slides"
     F+="$SLIDE_INFO_CHAIN"
@@ -646,23 +782,50 @@ build_full_filter() {
 run_stream() {
     local n_slides="$1"
     local attempt=1
+
+    build_image_array
+    if [ "${#IMAGE_FILES[@]}" -ne "$n_slides" ]; then
+        echo "WARNING: image array (${#IMAGE_FILES[@]}) doesn't match slide count ($n_slides) — resyncing."
+        n_slides=${#IMAGE_FILES[@]}
+    fi
+    if [ "$n_slides" -eq 0 ]; then
+        echo "ERROR: no images to stream."
+        return 1
+    fi
+
+    OVERLAY_INPUT_IDX=$n_slides
+    AUDIO_INPUT_IDX=$((n_slides + 1))
+
     local filter
     filter=$(build_full_filter "$n_slides")
 
+    # Each image is its own ffmpeg input (index 0..n-1) so it can get its
+    # own Ken Burns zoompan before being cross-faded into the next one.
+    local INPUT_ARGS=()
+    local f
+    for f in "${IMAGE_FILES[@]}"; do
+        INPUT_ARGS+=(-loop 1 -i "$f")
+    done
+    INPUT_ARGS+=(-loop 1 -i overlay.png)
+
+    if [ "$HAVE_MUSIC" = true ]; then
+        INPUT_ARGS+=(-stream_loop -1 -re -i "$MUSIC_FILE")
+    else
+        INPUT_ARGS+=(-f lavfi -i anullsrc=r=48000:cl=stereo)
+    fi
+
     while [ "$attempt" -le "$MAX_RETRIES" ]; do
         echo "----------------------------------------"
-        echo "Streaming Sol $CURRENT_SOL ($n_slides slides) — attempt ${attempt}/${MAX_RETRIES}"
+        echo "Streaming Sol $CURRENT_SOL ($n_slides slides, Ken Burns + crossfades, music=${HAVE_MUSIC}) — attempt ${attempt}/${MAX_RETRIES}"
         echo "----------------------------------------"
         set +e
         ffmpeg \
         -hide_banner \
         -loglevel info \
-        -f concat -safe 0 -i "$ASSET_DIR/concat_list.txt" \
-        -loop 1 -i overlay.png \
-        -f lavfi -i anullsrc=r=48000:cl=stereo \
+        "${INPUT_ARGS[@]}" \
         -filter_complex "$filter" \
         -map "[final]" \
-        -map 2:a \
+        -map "${AUDIO_INPUT_IDX}:a" \
         -r 30 \
         -s 1280x720 \
         -c:v libx264 \
@@ -682,6 +845,7 @@ run_stream() {
         -b:a 128k \
         -ar 48000 \
         -ac 2 \
+        -shortest \
         -f flv \
         "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
         local exit_code=$?
@@ -711,6 +875,8 @@ echo ""
 echo "Starting Mars Live Stream main loop..."
 echo ""
 
+prepare_music
+
 LAST_STREAMED_SOL=""
 CURRENT_SOL=""
 FETCHED_IMAGES=()
@@ -718,6 +884,9 @@ CAMERA_NAMES=()
 EARTH_DATES=()
 SOL_TIMES=()
 IMG_CAPTIONS=()
+IMAGE_FILES=()
+OVERLAY_INPUT_IDX=0
+AUDIO_INPUT_IDX=0
 DOWNLOAD_COUNT=0
 FACT_N=0
 HEAD_N=0
@@ -745,7 +914,6 @@ while true; do
             continue
         fi
 
-        build_concat_list
         run_stream "$N_SLIDES" || true
     else
         echo "ERROR: Failed to fetch Mars images. Retrying in 120s..."
