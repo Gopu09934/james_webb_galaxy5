@@ -338,6 +338,70 @@ probe_latest_sol() {
 }
 
 #############################################
+# dedup_and_diversify_batch
+#
+# NASA's raw-image feed returns images in API
+# order, which is often long runs of the SAME
+# camera taken seconds apart while the rover is
+# parked (e.g. a stack of NAVCAM_LEFT/RIGHT
+# frames of one static scene). Left as-is, that
+# makes 10-15 consecutive slides look like "the
+# same photo" even though every URL/camera/frame
+# number is genuinely different.
+#
+# This: (1) drops exact-duplicate image URLs,
+# (2) shuffles the surviving slide order so
+# different cameras/moments are interleaved
+# instead of clustered — increasing perceived
+# visual variety within the batch. It does NOT
+# affect the newest->oldest Sol/page walk across
+# batches, only the slide order inside one batch.
+#############################################
+dedup_and_diversify_batch() {
+    local n=${#FETCHED_IMAGES[@]}
+    local -A seen=()
+    local DEDUP_IMAGES=() DEDUP_CAMS=() DEDUP_DATES=() DEDUP_SOLT=() DEDUP_CAPS=()
+    local i url dup_count=0
+
+    for ((i = 0; i < n; i++)); do
+        url="${FETCHED_IMAGES[$i]}"
+        [ -z "$url" ] && continue
+        if [ -n "${seen[$url]:-}" ]; then
+            dup_count=$((dup_count + 1))
+            continue
+        fi
+        seen[$url]=1
+        DEDUP_IMAGES+=("$url")
+        DEDUP_CAMS+=("${CAMERA_NAMES[$i]:-}")
+        DEDUP_DATES+=("${EARTH_DATES[$i]:-}")
+        DEDUP_SOLT+=("${SOL_TIMES[$i]:-}")
+        DEDUP_CAPS+=("${IMG_CAPTIONS[$i]:-}")
+    done
+
+    local m=${#DEDUP_IMAGES[@]}
+    local order=()
+    if [ "$m" -gt 0 ]; then
+        while IFS= read -r idx; do order+=("$idx"); done < <(seq 0 $((m - 1)) | shuf)
+    fi
+
+    FETCHED_IMAGES=()
+    CAMERA_NAMES=()
+    EARTH_DATES=()
+    SOL_TIMES=()
+    IMG_CAPTIONS=()
+    local o
+    for o in "${order[@]}"; do
+        FETCHED_IMAGES+=("${DEDUP_IMAGES[$o]}")
+        CAMERA_NAMES+=("${DEDUP_CAMS[$o]}")
+        EARTH_DATES+=("${DEDUP_DATES[$o]}")
+        SOL_TIMES+=("${DEDUP_SOLT[$o]}")
+        IMG_CAPTIONS+=("${DEDUP_CAPS[$o]}")
+    done
+
+    echo "  Diversify: ${dup_count} exact duplicate(s) dropped, ${m} unique slides, order shuffled."
+}
+
+#############################################
 # fetch_batch
 #
 # Reads the cursor, fetches exactly one page
@@ -400,7 +464,8 @@ fetch_batch() {
 
         if [ "${batch_count:-0}" -gt 0 ]; then
             CURRENT_SOL="$CURSOR_SOL"
-            echo "  SUCCESS: Sol ${CURRENT_SOL} page ${CURSOR_PAGE} — ${batch_count} images."
+            dedup_and_diversify_batch
+            echo "  SUCCESS: Sol ${CURRENT_SOL} page ${CURSOR_PAGE} — ${batch_count} images fetched (${#FETCHED_IMAGES[@]} after dedup)."
             write_cursor "$CURSOR_SOL" "$((CURSOR_PAGE + 1))"
             return 0
         fi
