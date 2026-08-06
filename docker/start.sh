@@ -93,6 +93,18 @@ KB_SCALE_W=1400             # lowered from 1600 — smaller oversized canvas = c
 KB_SCALE_H=788
 TRANSITIONS=(fade dissolve wipeleft wiperight slideleft slideright smoothleft smoothright)  # dropped circleopen/circleclose — the circular mask math is the most expensive transition type
 
+# --- Live telemetry panel (fills the empty space below the Mars Fact
+# box) ---
+# NOTE: the raw-image feed has no live-weather endpoint, so temp/wind/
+# pressure are seeded from the Sol number into plausible Jezero Crater
+# ranges (based on published MEDA climatology). They hold steady for a
+# whole Sol and change when the Sol changes — not literal live sensor
+# telemetry, just realistic-looking numbers for the documentary feel.
+LANDING_DATE_EPOCH=$(date -u -d '2021-02-18' +%s 2>/dev/null || echo 1613606400)
+ROVER_LAT="18.4446"
+ROVER_LON="77.4509"
+STATUS_SLOT=15              # seconds each rotating rover-status line is shown
+
 # --- Background music (loops for the whole stream) ---
 MUSIC_URL="${MUSIC_URL:-}"          # set this as a secret/env var with a direct audio file URL to enable music
 MUSIC_FILE="$ASSET_DIR/bgm_audio"
@@ -160,6 +172,18 @@ MARS_HEADLINES=(
     "Dust devils and wind patterns reveal Martian atmospheric dynamics."
     "Ancient delta deposits in Jezero hint at a watery Martian past."
     "Perseverance teams up with Ingenuity for coordinated surface exploration."
+)
+
+#############################################
+# Rover Status Pool (cycled in the telemetry panel)
+#############################################
+ROVER_STATUSES=(
+    "ACTIVE — EXPLORING"
+    "ACTIVE — DRIVING"
+    "ACTIVE — SAMPLING ROCK CORE"
+    "ACTIVE — IMAGING TERRAIN"
+    "ACTIVE — TRANSMITTING DATA"
+    "ACTIVE — ANALYZING SPECTRA"
 )
 
 #############################################
@@ -425,9 +449,48 @@ download_images() {
 }
 
 #############################################
+# Generate live telemetry text: seeded weather,
+# time-on-Mars, location, and a shuffled pool of
+# rotating rover-status lines. See the NOTE above
+# LANDING_DATE_EPOCH re: weather being simulated.
+#############################################
+generate_telemetry_assets() {
+    local seed=$((CURRENT_SOL + 1000))
+    RANDOM=$seed
+    local temp_high=$(( -35 - (RANDOM % 20) ))      # -35 to -54 C daytime high
+    RANDOM=$((seed + 1))
+    local wind=$(( 6 + (RANDOM % 24) ))             # 6-29 km/h
+    RANDOM=$((seed + 2))
+    local pressure=$(( 640 + (RANDOM % 120) ))      # 640-759 Pa
+
+    printf '%s°C' "$temp_high" > "$ASSET_DIR/temp.txt"
+    printf '%s km/h' "$wind"   > "$ASSET_DIR/wind.txt"
+    printf '%s Pa' "$pressure" > "$ASSET_DIR/pressure.txt"
+
+    local now_epoch mission_days
+    now_epoch=$(date -u +%s)
+    mission_days=$(( (now_epoch - LANDING_DATE_EPOCH) / 86400 ))
+    printf 'SOL %s  •  %s days on Mars' "$CURRENT_SOL" "$mission_days" > "$ASSET_DIR/timeonmars.txt"
+
+    printf '%s°N  %s°E' "$ROVER_LAT" "$ROVER_LON" > "$ASSET_DIR/location.txt"
+
+    local i idx
+    local SHUFFLED_STATUS=()
+    while IFS= read -r line; do
+        SHUFFLED_STATUS+=("$line")
+    done < <(printf '%s\n' "${ROVER_STATUSES[@]}" | shuf)
+    STATUS_N=${#SHUFFLED_STATUS[@]}
+    for i in "${!SHUFFLED_STATUS[@]}"; do
+        idx=$((i + 1))
+        printf '%s' "${SHUFFLED_STATUS[$i]}" > "$ASSET_DIR/status${idx}.txt"
+    done
+}
+
+#############################################
 # Write panel text files
 #############################################
 write_panel_assets() {
+    generate_telemetry_assets
     printf 'MARS 2020'                          > "$ASSET_DIR/title1.txt"
     printf 'P E R S E V E R A N C E  R O V E R' > "$ASSET_DIR/title2.txt"
     printf "SOL %s RAW IMAGERY"  "$CURRENT_SOL" > "$ASSET_DIR/header.txt"
@@ -679,7 +742,7 @@ build_full_filter() {
     F+="$SLIDE_INFO_CHAIN"
     local prev="$SLIDE_INFO_END"
 
-    F+="[${prev}]drawbox=x=0:y=0:w=333:h=720:color=black@0.62:t=fill[p1];"
+    F+="[${prev}]drawbox=x=0:y=0:w=333:h=720:color=black@0.50:t=fill[p1];"
     F+="[p1]drawbox=x=333:y=0:w=4:h=720:color=black@0.45:t=fill[p2];"
     F+="[p2]drawbox=x=337:y=0:w=4:h=720:color=black@0.30:t=fill[p3];"
     F+="[p3]drawbox=x=341:y=0:w=4:h=720:color=black@0.15:t=fill[p4];"
@@ -740,7 +803,47 @@ build_full_filter() {
         fp_prev="$nxt"
     done
 
-    F+="[${fp_prev}]drawbox=x=10:y=560:w=326:h=115:color=black@0.55:t=fill[mi0];"
+    # --- Live Telemetry panel (fills the gap under the Mars Fact box) ---
+    F+="[${fp_prev}]drawbox=x=10:y=415:w=326:h=135:color=black@0.45:t=fill[tl0];"
+    F+="[tl0]drawbox=x=10:y=415:w=5:h=135:color=${GOLD}:t=fill[tl1];"
+    F+="[tl1]drawtext=fontfile=${FONT}:expansion=none:text='LIVE TELEMETRY':fontcolor=${GOLD}:fontsize=11:x=22:y=422[tl2];"
+
+    F+="[tl2]drawtext=fontfile=${FONT}:expansion=none:text='TEMP\:':fontcolor=white@0.70:fontsize=12:x=22:y=441[tl3];"
+    F+="[tl3]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/temp.txt:reload=1:fontcolor=${MARS_RED}:fontsize=13:x=68:y=440[tl4];"
+    F+="[tl4]drawtext=fontfile=${FONT}:expansion=none:text='WIND\:':fontcolor=white@0.70:fontsize=12:x=180:y=441[tl5];"
+    F+="[tl5]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/wind.txt:reload=1:fontcolor=white@0.90:fontsize=13:x=228:y=440[tl6];"
+
+    F+="[tl6]drawtext=fontfile=${FONT}:expansion=none:text='PRESSURE\:':fontcolor=white@0.70:fontsize=12:x=22:y=459[tl7];"
+    F+="[tl7]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/pressure.txt:reload=1:fontcolor=white@0.90:fontsize=13:x=100:y=458[tl8];"
+    F+="[tl8]drawbox=x=180:y=460:w=8:h=8:color=0x3DDC84:t=fill:enable='lt(mod(t\,3)\,2.5)'[tl9];"
+    F+="[tl9]drawtext=fontfile=${FONT}:expansion=none:text='SIGNAL LOCKED':fontcolor=white@0.85:fontsize=12:x=194:y=459[tl10];"
+
+    F+="[tl10]drawtext=fontfile=${FONT}:expansion=none:text='LOC\:':fontcolor=white@0.70:fontsize=12:x=22:y=477[tl11];"
+    F+="[tl11]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/location.txt:reload=1:fontcolor=white@0.90:fontsize=12:x=58:y=477[tl12];"
+
+    F+="[tl12]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/timeonmars.txt:reload=1:fontcolor=${GOLD}@0.90:fontsize=12:x=22:y=495[tl13];"
+
+    local STATUS_CYCLE=$((STATUS_N * STATUS_SLOT))
+    F+="[tl13]drawbox=x=22:y=513:w=9:h=9:color=0x3DDC84:t=fill:enable='lt(mod(t\,2)\,1.6)'[tl14];"
+    F+="[tl14]drawtext=fontfile=${FONT}:expansion=none:text='STATUS\:':fontcolor=white@0.70:fontsize=11:x=38:y=513[tl15];"
+    local st_prev="tl15"
+    for ((i = 0; i < STATUS_N; i++)); do
+        local sidx=$((i + 1))
+        local sstart=$((i * STATUS_SLOT))
+        local send=$((sstart + STATUS_SLOT))
+        local nxt="st${sidx}"
+        local SALPHA="if(between(mod(t\,${STATUS_CYCLE})\,${sstart}\,${send})\,if(lt(mod(t\,${STATUS_CYCLE})-${sstart}\,0.4)\,(mod(t\,${STATUS_CYCLE})-${sstart})/0.4\,if(gt(mod(t\,${STATUS_CYCLE})-${sstart}\,${STATUS_SLOT}-0.4)\,(${send}-mod(t\,${STATUS_CYCLE}))/0.4\,1))\,0)"
+        F+="[${st_prev}]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/status${sidx}.txt:fontcolor=white@0.92:fontsize=11:x=86:y=513:alpha='${SALPHA}'[${nxt}];"
+        st_prev="$nxt"
+    done
+
+    F+="[${st_prev}]drawtext=fontfile=${FONT}:expansion=none:text='POWER\:':fontcolor=white@0.70:fontsize=11:x=22:y=534[tlp1];"
+    F+="[tlp1]drawbox=x=70:y=532:w=110:h=9:color=white@0.15:t=fill[tlp2];"
+    F+="[tlp2]drawbox=x=70:y=532:w='110*(0.80+0.10*sin(t/6))':h=9:color=0x3DDC84:t=fill[tlp3];"
+    F+="[tlp3]drawbox=x=70:y=532:w=110:h=9:color=white@0.35:t=2[tlp4];"
+    F+="[tlp4]drawtext=fontfile=${FONT}:expansion=none:text='RTG STABLE':fontcolor=white@0.55:fontsize=10:x=186:y=533[tel_end];"
+
+    F+="[tel_end]drawbox=x=10:y=560:w=326:h=115:color=black@0.45:t=fill[mi0];"
     F+="[mi0]drawbox=x=10:y=560:w=5:h=115:color=${MARS_RED}:t=fill[mi1];"
     F+="[mi1]drawtext=fontfile=${FONT}:expansion=none:text='MISSION STATS':fontcolor=${GOLD}:fontsize=11:x=22:y=567[mi2];"
     F+="[mi2]drawtext=fontfile=${FONT}:expansion=none:text='Rover\: Perseverance (Percy)':fontcolor=white@0.85:fontsize=13:x=22:y=585[mi3];"
@@ -772,7 +875,8 @@ build_full_filter() {
     local sub_ring_d=$((SUB_ICON_R * 2))
     F+="[wm1]drawbox=x=${sub_ring_x}:y=${sub_ring_y}:w=${sub_ring_d}:h=${sub_ring_d}:color=${GOLD}@0.9:t=3:enable='${SUB_PULSE_ENABLE}'[wm2];"
 
-    F+="[wm2]drawbox=x=0:y=0:w=1280:h=720:color=black@0.5:t=2[final]"
+    F+="[wm2]drawbox=x=0:y=0:w=1280:h=720:color=black@0.5:t=2[vignette];"
+    F+="[vignette]eq=brightness=0.08:contrast=1.12:saturation=1.05[final]"
 
     echo "$F"
 }
@@ -899,6 +1003,7 @@ AUDIO_INPUT_IDX=0
 DOWNLOAD_COUNT=0
 FACT_N=0
 HEAD_N=0
+STATUS_N=0
 
 while true; do
     echo "========================================"
