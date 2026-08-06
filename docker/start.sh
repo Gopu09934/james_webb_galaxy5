@@ -1063,21 +1063,21 @@ run_stream() {
         -filter_complex_script "$filter_script" \
         -map "[final]" \
         -map "${AUDIO_INPUT_IDX}:a" \
-        -r 30 \
-        -s 1280x720 \
-        -c:v libx264 \
-        -preset ultrafast \
-        -tune zerolatency \
-        -threads 2 \
-        -profile:v high \
-        -level 4.1 \
-        -pix_fmt yuv420p \
-        -b:v 3000k \
-        -maxrate 3000k \
-        -bufsize 6000k \
-        -g 60 \
-        -keyint_min 60 \
-        -sc_threshold 0 \
+        -r 24 \
+-s 1280x720 \
+-c:v libx264 \
+-preset ultrafast \
+-tune zerolatency \
+-threads 2 \
+-profile:v high \
+-level 4.1 \
+-pix_fmt yuv420p \
+-b:v 3000k \
+-maxrate 3000k \
+-bufsize 6000k \
+-g 48 \
+-keyint_min 48 \
+-sc_threshold 0 \
         -c:a aac \
         -b:a 128k \
         -ar 48000 \
