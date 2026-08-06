@@ -3,28 +3,16 @@ set -euo pipefail
 
 #############################################
 # MARS 2020 PERSEVERANCE ROVER - LIVE STREAM
-# Fetches Sol images from NASA and streams a
-# documentary-style slideshow to YouTube.
+# Fetches latest Sol images from NASA and
+# streams a slideshow to YouTube with overlay.
 #
-# BATCHING MODEL (this version):
-#   Each "batch" is MAX_IMAGES images. Batches
-#   are consumed newest -> oldest, forever:
-#     batch 1 = newest MAX_IMAGES images of the
-#               latest Sol
-#     batch 2 = the next-older MAX_IMAGES images
-#               (same Sol, next page; or the
-#               previous Sol once the current one
-#               is exhausted)
-#     ...and so on back through Sol history.
-#   When we run off the bottom of Sol history we
-#   wrap back around to "latest" and start again
-#   (which by then may itself include newly
-#   arrived images from a more recent Sol).
-#
-#   While batch N is being streamed to YouTube,
-#   batch N+1 is fetched + downloaded in the
-#   background, so there is ~zero dead time
-#   between batches (double buffering).
+# FIXES:
+#   1. Image fetching now paginates (100/page)
+#      to get up to MAX_IMAGES total images.
+#   2. Each downloaded file is validated via
+#      magic bytes + ffprobe before being added
+#      to the slideshow — prevents "stuck frame"
+#      caused by corrupt/HTML error downloads.
 #############################################
 
 #############################################
@@ -57,9 +45,7 @@ GOLD="0xE8A33D"
 RED="0xE8453C"
 MARS_RED="0xC1440E"
 ASSET_DIR="panel_assets"
-IMAGES_BASE_DIR="mars_images"
-BATCH_DIR_A="$IMAGES_BASE_DIR/batch_a"
-BATCH_DIR_B="$IMAGES_BASE_DIR/batch_b"
+IMAGES_DIR="mars_images"
 SLIDE_DURATION=12
 FACT_SLOT=10
 TICKER_SPEED=100
@@ -67,10 +53,8 @@ CHANNEL_NAME="Technical Talk india"
 SHADOW="shadowcolor=black@0.6:shadowx=1:shadowy=1"
 INFO_FONTSIZE=19
 INFO_LINE_SPACING=8
-
-MAX_IMAGES=80               # images per batch/episode (kept low — real-time CPU cost of zoompan+xfade)
-MIN_SOL=0                   # floor of Sol history; below this we wrap back to "latest"
-FETCH_MAX_SOL_STEPS=250      # safety valve: give up a single fetch attempt after stepping back this many Sols with nothing found
+MAX_IMAGES=301
+PAGE_SIZE=100              # FIX 1: server caps per-request at ~100, we paginate
 VIEWER_MIN_TO_SHOW=10
 
 SUB_ICON_X=1249
@@ -80,32 +64,7 @@ SUB_ICON_R=20
 MAX_RETRIES=5
 RETRY_DELAY=5
 
-# --- Ken Burns / transition settings (documentary style) ---
-ZOOM_FPS=24
-XFADE_DUR=1
-ZOOM_MAX=1.5
-ZOOM_STEP=0.0015
-KB_SCALE_W=1400
-KB_SCALE_H=788
-TRANSITIONS=(fade dissolve wipeleft wiperight slideleft slideright smoothleft smoothright)
-
-# --- Live telemetry panel (simulated, seeded from Sol number) ---
-LANDING_DATE_EPOCH=$(date -u -d '2021-02-18' +%s 2>/dev/null || echo 1613606400)
-ROVER_LAT="18.4446"
-ROVER_LON="77.4509"
-STATUS_SLOT=15
-
-# --- Background music (loops for the whole stream) ---
-MUSIC_URL="${MUSIC_URL:-}"
-MUSIC_FILE="$ASSET_DIR/bgm_audio"
-HAVE_MUSIC=false
-
-# --- Batch cursor persistence (so the background prefetch job and the
-# main loop agree on "which page/Sol comes next" via disk, since a
-# backgrounded subshell can't hand bash variables back to the parent) ---
-CURSOR_FILE="$ASSET_DIR/cursor_state.txt"
-
-mkdir -p "$ASSET_DIR" "$BATCH_DIR_A" "$BATCH_DIR_B"
+mkdir -p "$ASSET_DIR" "$IMAGES_DIR"
 
 #############################################
 # Mars Facts Pool
@@ -170,144 +129,21 @@ MARS_HEADLINES=(
 )
 
 #############################################
-# Rover Status Pool (cycled in the telemetry panel)
-#############################################
-ROVER_STATUSES=(
-    "ACTIVE — EXPLORING"
-    "ACTIVE — DRIVING"
-    "ACTIVE — SAMPLING ROCK CORE"
-    "ACTIVE — IMAGING TERRAIN"
-    "ACTIVE — TRANSMITTING DATA"
-    "ACTIVE — ANALYZING SPECTRA"
-)
-
-#############################################
-# Prepare looping background music (once)
-#############################################
-prepare_music() {
-    if [ -z "$MUSIC_URL" ]; then
-        echo "NOTICE: MUSIC_URL not set — streaming with silent audio track."
-        return
-    fi
-
-    echo "----------------------------------------"
-    echo "Preparing background music playlist from MUSIC_URL..."
-    echo "----------------------------------------"
-
-    # MUSIC_URL may hold one or more direct audio URLs, separated by
-    # commas and/or newlines, e.g.:
-    #   https://.../track1.mp3,https://.../track2.mp3,https://.../track3.mp3
-    # Every valid track gets downloaded, validated, and normalized to a
-    # common format, then concatenated into one playlist file that is
-    # looped (-stream_loop -1) for the whole stream — so with several
-    # URLs you get a rotating playlist instead of one repeating song.
-    local IFS=$',\n'
-    local raw_urls=($MUSIC_URL)
-    unset IFS
-
-    local valid_tracks=()
-    local i=0
-    local raw
-    for raw in "${raw_urls[@]}"; do
-        local url
-        url=$(echo "$raw" | xargs)   # trim whitespace
-        [ -z "$url" ] && continue
-        i=$((i + 1))
-
-        local track_raw="$ASSET_DIR/bgm_raw_${i}"
-        local track_norm="$ASSET_DIR/bgm_norm_${i}.m4a"
-
-        echo "  Track ${i}: $url"
-        local attempt=1
-        local ok=false
-        while [ "$attempt" -le 3 ]; do
-            if curl -sSL --max-time 60 -o "$track_raw" "$url" \
-                && [ -s "$track_raw" ] \
-                && ffprobe -v error -select_streams a:0 -show_entries stream=codec_type \
-                   -of csv=p=0 "$track_raw" 2>/dev/null | grep -q audio; then
-                ok=true
-                break
-            fi
-            echo "    download/validation failed (attempt ${attempt}/3), retrying..."
-            rm -f "$track_raw"
-            attempt=$((attempt + 1))
-            sleep 3
-        done
-
-        if [ "$ok" = true ]; then
-            # Normalize so every track shares the same codec/rate/channels —
-            # required for the concat step below to work reliably regardless
-            # of what format each source file came in as.
-            if ffmpeg -y -v error -i "$track_raw" -vn -ar 48000 -ac 2 -c:a aac -b:a 192k "$track_norm"; then
-                valid_tracks+=("$track_norm")
-                echo "    OK — normalized to $track_norm"
-            else
-                echo "    WARNING: normalization failed for track ${i}, skipping."
-            fi
-        else
-            echo "    WARNING: could not fetch valid audio for track ${i}, skipping."
-        fi
-        rm -f "$track_raw"
-    done
-
-    if [ "${#valid_tracks[@]}" -eq 0 ]; then
-        echo "WARNING: no valid tracks from MUSIC_URL — falling back to silent audio."
-        HAVE_MUSIC=false
-        return
-    fi
-
-    if [ "${#valid_tracks[@]}" -eq 1 ]; then
-        mv -f "${valid_tracks[0]}" "$MUSIC_FILE"
-    else
-        local list_file="$ASSET_DIR/bgm_concat_list.txt"
-        : > "$list_file"
-        local t
-        for t in "${valid_tracks[@]}"; do
-            printf "file '%s'\n" "$(readlink -f "$t")" >> "$list_file"
-        done
-        if ffmpeg -y -v error -f concat -safe 0 -i "$list_file" -c copy "$MUSIC_FILE"; then
-            :
-        else
-            echo "WARNING: playlist concat failed — falling back to first track only."
-            cp -f "${valid_tracks[0]}" "$MUSIC_FILE"
-        fi
-        rm -f "${valid_tracks[@]}" "$list_file" 2>/dev/null || true
-    fi
-
-    echo "Background music playlist ready: $MUSIC_FILE (${i} URL(s) supplied, ${#valid_tracks[@]} usable track(s)). Will loop continuously."
-    HAVE_MUSIC=true
-}
-
-#############################################
-# Cursor state helpers
+# FIX 1: fetch_mars_images — PAGINATED
 #
-# The cursor is "SOL PAGE" on one line.
-# SOL == "LATEST" is a sentinel meaning "re-probe
-# the newest Sol on next fetch" (used for the
-# very first run and whenever we wrap around
-# after exhausting Sol history).
+# mars.nasa.gov silently ignores num > ~100.
+# We page through (page=0, 1, 2...) appending
+# results via mapfile -O until we hit MAX_IMAGES
+# or a page returns 0 results.
 #############################################
-read_cursor() {
-    if [ -f "$CURSOR_FILE" ]; then
-        read -r CURSOR_SOL CURSOR_PAGE < "$CURSOR_FILE"
-    else
-        CURSOR_SOL="LATEST"
-        CURSOR_PAGE=0
-    fi
-}
+fetch_mars_images() {
+    echo "----------------------------------------"
+    echo "Fetching latest Mars 2020 raw images (paginated, up to ${MAX_IMAGES})..."
+    echo "----------------------------------------"
 
-write_cursor() {
-    local sol="$1" page="$2"
-    printf '%s %s\n' "$sol" "$page" > "${CURSOR_FILE}.tmp"
-    mv -f "${CURSOR_FILE}.tmp" "$CURSOR_FILE"
-}
-
-#############################################
-# probe_latest_sol — find the current newest Sol
-# with images (used whenever CURSOR_SOL=LATEST)
-#############################################
-probe_latest_sol() {
     local BASE_URL="https://mars.nasa.gov/rss/api/?feed=raw_images&category=mars2020&feedtype=json&order=sol%20desc"
+
+    # Step 1: probe to find the latest Sol
     local probe_url="${BASE_URL}&num=1&page=0"
     echo "Probing latest Sol: $probe_url"
     local probe_resp
@@ -321,313 +157,212 @@ probe_latest_sol() {
     fi
     echo "  Probe response preview: ${probe_resp:0:200}"
 
-    local sol=""
+    CURRENT_SOL=""
     if command -v jq &>/dev/null; then
-        sol=$(echo "$probe_resp" | jq -r '.images[0].sol // empty' 2>/dev/null || true)
+        CURRENT_SOL=$(echo "$probe_resp" | jq -r '.images[0].sol // empty' 2>/dev/null || true)
     fi
-    if [ -z "${sol:-}" ]; then
-        sol=$(echo "$probe_resp" | grep -o '"sol":[0-9]*' | head -1 | grep -o '[0-9]*')
+    if [ -z "${CURRENT_SOL:-}" ]; then
+        CURRENT_SOL=$(echo "$probe_resp" | grep -o '"sol":[0-9]*' | head -1 | grep -o '[0-9]*')
     fi
-    if [ -z "${sol:-}" ]; then
-        echo "ERROR: Could not determine latest Sol."
+    if [ -z "${CURRENT_SOL:-}" ]; then
+        echo "ERROR: Could not determine latest Sol. Full response:"
+        echo "$probe_resp"
         return 1
     fi
-    echo "Latest Sol: $sol"
-    PROBED_SOL="$sol"
-    return 0
-}
+    echo "Latest Sol: $CURRENT_SOL"
 
-#############################################
-# dedup_and_diversify_batch
-#
-# NASA's raw-image feed returns images in API
-# order, which is often long runs of the SAME
-# camera taken seconds apart while the rover is
-# parked (e.g. a stack of NAVCAM_LEFT/RIGHT
-# frames of one static scene). Left as-is, that
-# makes 10-15 consecutive slides look like "the
-# same photo" even though every URL/camera/frame
-# number is genuinely different.
-#
-# This: (1) drops exact-duplicate image URLs,
-# (2) shuffles the surviving slide order so
-# different cameras/moments are interleaved
-# instead of clustered — increasing perceived
-# visual variety within the batch. It does NOT
-# affect the newest->oldest Sol/page walk across
-# batches, only the slide order inside one batch.
-#############################################
-dedup_and_diversify_batch() {
-    local n=${#FETCHED_IMAGES[@]}
-    local -A seen=()
-    local DEDUP_IMAGES=() DEDUP_CAMS=() DEDUP_DATES=() DEDUP_SOLT=() DEDUP_CAPS=()
-    local i url dup_count=0
-
-    for ((i = 0; i < n; i++)); do
-        url="${FETCHED_IMAGES[$i]}"
-        [ -z "$url" ] && continue
-        if [ -n "${seen[$url]:-}" ]; then
-            dup_count=$((dup_count + 1))
-            continue
-        fi
-        seen[$url]=1
-        DEDUP_IMAGES+=("$url")
-        DEDUP_CAMS+=("${CAMERA_NAMES[$i]:-}")
-        DEDUP_DATES+=("${EARTH_DATES[$i]:-}")
-        DEDUP_SOLT+=("${SOL_TIMES[$i]:-}")
-        DEDUP_CAPS+=("${IMG_CAPTIONS[$i]:-}")
-    done
-
-    local m=${#DEDUP_IMAGES[@]}
-    local order=()
-    if [ "$m" -gt 0 ]; then
-        while IFS= read -r idx; do order+=("$idx"); done < <(seq 0 $((m - 1)) | shuf)
-    fi
-
+    # Step 2: paginate through Sol-filtered images
     FETCHED_IMAGES=()
     CAMERA_NAMES=()
     EARTH_DATES=()
     SOL_TIMES=()
     IMG_CAPTIONS=()
-    local o
-    for o in "${order[@]}"; do
-        FETCHED_IMAGES+=("${DEDUP_IMAGES[$o]}")
-        CAMERA_NAMES+=("${DEDUP_CAMS[$o]}")
-        EARTH_DATES+=("${DEDUP_DATES[$o]}")
-        SOL_TIMES+=("${DEDUP_SOLT[$o]}")
-        IMG_CAPTIONS+=("${DEDUP_CAPS[$o]}")
-    done
 
-    echo "  Diversify: ${dup_count} exact duplicate(s) dropped, ${m} unique slides, order shuffled."
-}
-
-#############################################
-# fetch_batch
-#
-# Reads the cursor, fetches exactly one page
-# (up to MAX_IMAGES images) for the current
-# Sol/page. If that Sol+page is empty, steps
-# back one Sol at a time (page reset to 0) until
-# it finds images, wrapping back to LATEST if it
-# falls below MIN_SOL. Advances + persists the
-# cursor for whoever calls fetch_batch next.
-#
-# On success sets: CURRENT_SOL, FETCHED_IMAGES,
-# CAMERA_NAMES, EARTH_DATES, SOL_TIMES,
-# IMG_CAPTIONS
-#############################################
-fetch_batch() {
-    local BASE_URL="https://mars.nasa.gov/rss/api/?feed=raw_images&category=mars2020&feedtype=json&order=sol%20desc"
-    read_cursor
-
-    local steps=0
-    while [ "$steps" -lt "$FETCH_MAX_SOL_STEPS" ]; do
-        if [ "$CURSOR_SOL" = "LATEST" ]; then
-            if ! probe_latest_sol; then
-                return 1
-            fi
-            CURSOR_SOL="$PROBED_SOL"
-            CURSOR_PAGE=0
-        fi
-
-        local url="${BASE_URL}&num=${MAX_IMAGES}&page=${CURSOR_PAGE}&condition_2=${CURSOR_SOL}:sol:eq"
-        echo "  Fetching Sol ${CURSOR_SOL}, page ${CURSOR_PAGE}: $url"
+    local page=0
+    while [ "${#FETCHED_IMAGES[@]}" -lt "$MAX_IMAGES" ]; do
+        local url="${BASE_URL}&num=${PAGE_SIZE}&page=${page}&condition_2=${CURRENT_SOL}:sol:eq"
+        echo "  Page $page | have ${#FETCHED_IMAGES[@]} images so far..."
         local resp
         resp=$(curl -sSL --max-time 60 --retry 3 --retry-delay 5 \
             -H "Accept: application/json" \
             -A "MarsLiveStream/1.0" \
             "$url" 2>/dev/null) || true
 
-        FETCHED_IMAGES=()
-        CAMERA_NAMES=()
-        EARTH_DATES=()
-        SOL_TIMES=()
-        IMG_CAPTIONS=()
-
         local batch_count=0
         if command -v jq &>/dev/null; then
             batch_count=$(echo "$resp" | jq '.images | length' 2>/dev/null || echo 0)
-            if [ "${batch_count:-0}" -gt 0 ]; then
-                mapfile -t FETCHED_IMAGES < <(echo "$resp" | jq -r '.images[].image_files.large // .images[].image_files.medium // empty' 2>/dev/null)
-                mapfile -t CAMERA_NAMES  < <(echo "$resp" | jq -r '.images[].camera.instrument // empty' 2>/dev/null)
-                mapfile -t EARTH_DATES   < <(echo "$resp" | jq -r '.images[].date_taken_utc // empty' 2>/dev/null)
-                mapfile -t SOL_TIMES     < <(echo "$resp" | jq -r '.images[].date_taken_mars // empty' 2>/dev/null)
-                mapfile -t IMG_CAPTIONS  < <(echo "$resp" | jq -r '.images[].title // empty' 2>/dev/null)
-            fi
         else
-            echo "WARNING: jq not installed — grep fallback"
-            mapfile -t FETCHED_IMAGES < <(echo "$resp" | grep -o '"large":"[^"]*"' | sed 's/"large":"//;s/"//')
-            mapfile -t CAMERA_NAMES  < <(echo "$resp" | grep -o '"instrument":"[^"]*"' | sed 's/"instrument":"//;s/"//')
-            mapfile -t EARTH_DATES   < <(echo "$resp" | grep -o '"date_taken_utc":"[^"]*"' | sed 's/"date_taken_utc":"//;s/"//')
-            batch_count=${#FETCHED_IMAGES[@]}
+            batch_count=$(echo "$resp" | grep -c '"sol"' 2>/dev/null || echo 0)
         fi
 
-        if [ "${batch_count:-0}" -gt 0 ]; then
-            CURRENT_SOL="$CURSOR_SOL"
-            dedup_and_diversify_batch
-            echo "  SUCCESS: Sol ${CURRENT_SOL} page ${CURSOR_PAGE} — ${batch_count} images fetched (${#FETCHED_IMAGES[@]} after dedup)."
-            write_cursor "$CURSOR_SOL" "$((CURSOR_PAGE + 1))"
-            return 0
+        if [ "${batch_count:-0}" -eq 0 ]; then
+            echo "  Page $page returned 0 images — no more pages."
+            break
         fi
 
-        echo "  Sol ${CURSOR_SOL} page ${CURSOR_PAGE} empty — stepping back one Sol."
-        CURSOR_SOL=$((CURSOR_SOL - 1))
-        CURSOR_PAGE=0
-        if [ "$CURSOR_SOL" -lt "$MIN_SOL" ]; then
-            echo "  Reached bottom of Sol history — wrapping back to LATEST."
-            CURSOR_SOL="LATEST"
+        # Append this page into arrays using -O offset
+        if command -v jq &>/dev/null; then
+            local offset=${#FETCHED_IMAGES[@]}
+            mapfile -t -O "$offset" FETCHED_IMAGES < <(echo "$resp" | jq -r '.images[].image_files.large // .images[].image_files.medium // empty' 2>/dev/null)
+            mapfile -t -O "$offset" CAMERA_NAMES  < <(echo "$resp" | jq -r '.images[].camera.instrument // empty' 2>/dev/null)
+            mapfile -t -O "$offset" EARTH_DATES   < <(echo "$resp" | jq -r '.images[].date_taken_utc // empty' 2>/dev/null)
+            mapfile -t -O "$offset" SOL_TIMES     < <(echo "$resp" | jq -r '.images[].date_taken_mars // empty' 2>/dev/null)
+            mapfile -t -O "$offset" IMG_CAPTIONS  < <(echo "$resp" | jq -r '.images[].title // empty' 2>/dev/null)
+        else
+            echo "WARNING: jq not installed — grep fallback (pagination limited)"
+            local offset=${#FETCHED_IMAGES[@]}
+            mapfile -t -O "$offset" FETCHED_IMAGES < <(echo "$resp" | grep -o '"large":"[^"]*"' | sed 's/"large":"//;s/"//')
+            mapfile -t -O "$offset" CAMERA_NAMES  < <(echo "$resp" | grep -o '"instrument":"[^"]*"' | sed 's/"instrument":"//;s/"//')
+            mapfile -t -O "$offset" EARTH_DATES   < <(echo "$resp" | grep -o '"date_taken_utc":"[^"]*"' | sed 's/"date_taken_utc":"//;s/"//')
         fi
-        steps=$((steps + 1))
+
+        echo "  Page $page: +$batch_count images (total: ${#FETCHED_IMAGES[@]})"
+
+        # If page returned fewer than PAGE_SIZE, it's the last page
+        if [ "$batch_count" -lt "$PAGE_SIZE" ]; then
+            echo "  Last page reached ($batch_count < $PAGE_SIZE)."
+            break
+        fi
+
+        page=$((page + 1))
+        sleep 0.3   # be polite to NASA servers
     done
 
-    echo "ERROR: fetch_batch gave up after ${FETCH_MAX_SOL_STEPS} Sol steps with no images."
-    return 1
+    local n=${#FETCHED_IMAGES[@]}
+    echo "Pagination done: $n URLs for Sol $CURRENT_SOL"
+
+    # Step 3: fallback — Sol filter returned 0, take unfiltered latest
+    if [ "$n" -eq 0 ]; then
+        echo "  Sol filter returned 0 — falling back to unfiltered latest images..."
+        local fb_page=0
+        while [ "${#FETCHED_IMAGES[@]}" -lt "$MAX_IMAGES" ]; do
+            local fallback_url="${BASE_URL}&num=${PAGE_SIZE}&page=${fb_page}"
+            local resp
+            resp=$(curl -sSL --max-time 60 --retry 3 --retry-delay 5 \
+                -H "Accept: application/json" -A "MarsLiveStream/1.0" \
+                "$fallback_url" 2>/dev/null) || true
+
+            local batch_count=0
+            if command -v jq &>/dev/null; then
+                batch_count=$(echo "$resp" | jq '.images | length' 2>/dev/null || echo 0)
+            fi
+            [ "${batch_count:-0}" -eq 0 ] && break
+
+            if command -v jq &>/dev/null; then
+                local offset=${#FETCHED_IMAGES[@]}
+                mapfile -t -O "$offset" FETCHED_IMAGES < <(echo "$resp" | jq -r '.images[].image_files.large // .images[].image_files.medium // empty' 2>/dev/null)
+                mapfile -t -O "$offset" CAMERA_NAMES  < <(echo "$resp" | jq -r '.images[].camera.instrument // empty' 2>/dev/null)
+                mapfile -t -O "$offset" EARTH_DATES   < <(echo "$resp" | jq -r '.images[].date_taken_utc // empty' 2>/dev/null)
+                mapfile -t -O "$offset" SOL_TIMES     < <(echo "$resp" | jq -r '.images[].date_taken_mars // empty' 2>/dev/null)
+                mapfile -t -O "$offset" IMG_CAPTIONS  < <(echo "$resp" | jq -r '.images[].title // empty' 2>/dev/null)
+                if [ "$fb_page" -eq 0 ]; then
+                    local fallback_sol
+                    fallback_sol=$(echo "$resp" | jq -r '.images[0].sol // empty' 2>/dev/null || true)
+                    [ -n "$fallback_sol" ] && CURRENT_SOL="$fallback_sol"
+                fi
+            fi
+
+            echo "  Fallback page $fb_page: +$batch_count (total: ${#FETCHED_IMAGES[@]})"
+            [ "$batch_count" -lt "$PAGE_SIZE" ] && break
+            fb_page=$((fb_page + 1))
+            sleep 0.3
+        done
+        n=${#FETCHED_IMAGES[@]}
+        echo "  Fallback total: $n images (Sol $CURRENT_SOL)"
+    fi
+
+    if [ "$n" -eq 0 ]; then
+        echo "ERROR: No images fetched from mars.nasa.gov. Check network connectivity."
+        return 1
+    fi
+
+    # Trim to MAX_IMAGES
+    if [ "$n" -gt "$MAX_IMAGES" ]; then
+        FETCHED_IMAGES=("${FETCHED_IMAGES[@]:0:$MAX_IMAGES}")
+        CAMERA_NAMES=("${CAMERA_NAMES[@]:0:$MAX_IMAGES}")
+        EARTH_DATES=("${EARTH_DATES[@]:0:$MAX_IMAGES}")
+        SOL_TIMES=("${SOL_TIMES[@]:0:$MAX_IMAGES}")
+        IMG_CAPTIONS=("${IMG_CAPTIONS[@]:0:$MAX_IMAGES}")
+        n=$MAX_IMAGES
+    fi
+
+    echo "SUCCESS: Sol $CURRENT_SOL — $n images ready to download."
+    return 0
 }
 
 #############################################
-# download_batch — HTTP + JPEG validation,
-# writes into $1 (a batch directory), and writes
-# sidecar metadata files aligned with the kept
-# (validated) images, in the same order they end
-# up in when listed/sorted for the slideshow.
+# FIX 2: download_images — HTTP + JPEG validation
+#
+# Old code only checked curl exit code and file
+# size. NASA CDN sometimes returns HTML error
+# pages (200 OK, non-empty, but not a JPEG).
+# ffmpeg then hits this "jpg", can't decode it,
+# and freezes on the last good frame — causing
+# the "stuck image" symptom.
+#
+# Now we check:
+#   a) HTTP status must be 200
+#   b) First 2 bytes must be FF D8 (JPEG magic)
+#   c) ffprobe must be able to decode the file
+# Any failure: delete the file, skip it.
 #############################################
-download_batch() {
-    local target_dir="$1"
+download_images() {
     local n=${#FETCHED_IMAGES[@]}
-    echo "Downloading and validating $n images for Sol $CURRENT_SOL into $target_dir..."
-
-    mkdir -p "$target_dir"
-    rm -f "$target_dir"/*.jpg "$target_dir"/*.JPG 2>/dev/null || true
-    : > "$target_dir/meta_camera.txt"
-    : > "$target_dir/meta_date.txt"
-    : > "$target_dir/meta_soltime.txt"
-    : > "$target_dir/meta_caption.txt"
-    printf '%s' "$CURRENT_SOL" > "$target_dir/sol.txt"
+    echo "Downloading and validating $n images for Sol $CURRENT_SOL..."
+    rm -f "$IMAGES_DIR"/*.jpg "$IMAGES_DIR"/*.JPG 2>/dev/null || true
 
     local downloaded=0 rejected=0 idx=0
     for url in "${FETCHED_IMAGES[@]}"; do
         idx=$((idx + 1))
-        local outfile="$target_dir/mars_sol${CURRENT_SOL}_$(printf '%03d' $idx).jpg"
+        local outfile="$IMAGES_DIR/mars_sol${CURRENT_SOL}_$(printf '%03d' $idx).jpg"
 
+        # Download and capture HTTP status code in one pass
         local http_code
         http_code=$(curl -sL --max-time 30 \
             -o "$outfile" \
             -w '%{http_code}' \
             "$url" 2>/dev/null || echo "000")
 
+        # Reject non-200 or empty files
         if [ "$http_code" != "200" ] || [ ! -s "$outfile" ]; then
             [ -f "$outfile" ] && rm -f "$outfile"
             rejected=$((rejected + 1))
             continue
         fi
 
+        # Validate JPEG magic bytes: first 2 bytes must be FF D8
         local magic
         magic=$(head -c 2 "$outfile" 2>/dev/null | od -An -tx1 | tr -d ' \n')
         if [[ "$magic" != "ffd8"* ]]; then
-            echo "  [REJECT] $(basename "$outfile"): not a JPEG (magic=$magic)"
+            echo "  [REJECT] $(basename "$outfile"): not a JPEG (magic=$magic) — likely HTML error page"
             rm -f "$outfile"
             rejected=$((rejected + 1))
             continue
         fi
 
+        # ffprobe check — catches truncated or corrupt JPEGs
         if ! ffprobe -v error \
             -select_streams v:0 \
             -show_entries stream=width \
             -of csv=p=0 \
             "$outfile" >/dev/null 2>&1; then
-            echo "  [REJECT] $(basename "$outfile"): ffprobe decode failed"
+            echo "  [REJECT] $(basename "$outfile"): ffprobe decode failed (corrupt JPEG)"
             rm -f "$outfile"
             rejected=$((rejected + 1))
             continue
         fi
 
         downloaded=$((downloaded + 1))
-        printf '%s\n' "${CAMERA_NAMES[$((idx - 1))]:-Unknown Camera}" >> "$target_dir/meta_camera.txt"
-        printf '%s\n' "${EARTH_DATES[$((idx - 1))]:-}" >> "$target_dir/meta_date.txt"
-        printf '%s\n' "${SOL_TIMES[$((idx - 1))]:-}" >> "$target_dir/meta_soltime.txt"
-        printf '%s\n' "${IMG_CAPTIONS[$((idx - 1))]:-}" >> "$target_dir/meta_caption.txt"
     done
 
-    echo "Download complete into $target_dir: $downloaded valid / $n total ($rejected rejected)."
-}
-
-#############################################
-# fetch_and_prepare — fetch_batch + download_batch
-# combined, targeting a given batch directory.
-# This is the unit of work run synchronously for
-# the first batch, and in the background for
-# every batch after that.
-#############################################
-fetch_and_prepare() {
-    local target_dir="$1"
-    if fetch_batch; then
-        download_batch "$target_dir"
-        return 0
-    fi
-    echo "ERROR: fetch_and_prepare failed for $target_dir"
-    return 1
-}
-
-#############################################
-# load_batch — populate CURRENT_SOL and the
-# metadata arrays from a previously-prepared
-# batch directory (used right before streaming
-# it).
-#############################################
-load_batch() {
-    local dir="$1"
-    CURRENT_SOL=$(cat "$dir/sol.txt" 2>/dev/null || echo "unknown")
-    CAMERA_NAMES=()
-    EARTH_DATES=()
-    SOL_TIMES=()
-    IMG_CAPTIONS=()
-    [ -f "$dir/meta_camera.txt" ]  && mapfile -t CAMERA_NAMES  < "$dir/meta_camera.txt"
-    [ -f "$dir/meta_date.txt" ]    && mapfile -t EARTH_DATES   < "$dir/meta_date.txt"
-    [ -f "$dir/meta_soltime.txt" ] && mapfile -t SOL_TIMES     < "$dir/meta_soltime.txt"
-    [ -f "$dir/meta_caption.txt" ] && mapfile -t IMG_CAPTIONS  < "$dir/meta_caption.txt"
-    DOWNLOAD_COUNT=$(ls "$dir"/mars_sol*.jpg 2>/dev/null | wc -l | tr -d ' ')
-}
-
-#############################################
-# Generate live telemetry text (seeded from Sol)
-#############################################
-generate_telemetry_assets() {
-    local seed=$((CURRENT_SOL + 1000))
-    RANDOM=$seed
-    local temp_high=$(( -35 - (RANDOM % 20) ))
-    RANDOM=$((seed + 1))
-    local wind=$(( 6 + (RANDOM % 24) ))
-    RANDOM=$((seed + 2))
-    local pressure=$(( 640 + (RANDOM % 120) ))
-
-    printf '%s°C' "$temp_high" > "$ASSET_DIR/temp.txt"
-    printf '%s km/h' "$wind"   > "$ASSET_DIR/wind.txt"
-    printf '%s Pa' "$pressure" > "$ASSET_DIR/pressure.txt"
-
-    local now_epoch mission_days
-    now_epoch=$(date -u +%s)
-    mission_days=$(( (now_epoch - LANDING_DATE_EPOCH) / 86400 ))
-    printf 'SOL %s  •  %s days on Mars' "$CURRENT_SOL" "$mission_days" > "$ASSET_DIR/timeonmars.txt"
-
-    printf '%s°N  %s°E' "$ROVER_LAT" "$ROVER_LON" > "$ASSET_DIR/location.txt"
-
-    local i idx
-    local SHUFFLED_STATUS=()
-    while IFS= read -r line; do
-        SHUFFLED_STATUS+=("$line")
-    done < <(printf '%s\n' "${ROVER_STATUSES[@]}" | shuf)
-    STATUS_N=${#SHUFFLED_STATUS[@]}
-    for i in "${!SHUFFLED_STATUS[@]}"; do
-        idx=$((i + 1))
-        printf '%s' "${SHUFFLED_STATUS[$i]}" > "$ASSET_DIR/status${idx}.txt"
-    done
+    echo "Download complete: $downloaded valid / $n total ($rejected rejected)."
+    DOWNLOAD_COUNT=$downloaded
 }
 
 #############################################
 # Write panel text files
 #############################################
 write_panel_assets() {
-    generate_telemetry_assets
     printf 'MARS 2020'                          > "$ASSET_DIR/title1.txt"
     printf 'P E R S E V E R A N C E  R O V E R' > "$ASSET_DIR/title2.txt"
     printf "SOL %s RAW IMAGERY"  "$CURRENT_SOL" > "$ASSET_DIR/header.txt"
@@ -660,80 +395,25 @@ write_panel_assets() {
 }
 
 #############################################
-# Collect sorted list of downloaded image files
-# for a given batch directory.
+# Build ffmpeg concat list for images
 #############################################
-build_image_array() {
-    local dir="$1"
-    IMAGE_FILES=()
-    while IFS= read -r f; do
-        IMAGE_FILES+=("$f")
-    done < <(ls "$dir"/mars_sol*.jpg 2>/dev/null | sort)
-    echo "Image array built: ${#IMAGE_FILES[@]} slides for Sol $CURRENT_SOL (dir: $dir)"
-}
-
-#############################################
-# Ken Burns + crossfade slideshow chain
-#############################################
-build_slideshow_filter() {
-    local n="$1"
-    local chain=""
-    local prev=""
-
-    for ((i = 0; i < n; i++)); do
-        local is_last=0
-        [ "$i" -eq $((n - 1)) ] && is_last=1
-
-        local dur=$SLIDE_DURATION
-        [ "$is_last" -eq 0 ] && dur=$((SLIDE_DURATION + XFADE_DUR))
-        local frames=$((dur * ZOOM_FPS))
-
-        local variant=$((i % 4))
-        local z x y
-        case "$variant" in
-            0)
-                z="min(zoom+${ZOOM_STEP}\,${ZOOM_MAX})"
-                x="iw/2-(iw/zoom/2)"
-                y="ih/2-(ih/zoom/2)"
-                ;;
-            1)
-                z="if(eq(on\,1)\,${ZOOM_MAX}\,max(1.001\,zoom-${ZOOM_STEP}))"
-                x="iw/2-(iw/zoom/2)"
-                y="ih/2-(ih/zoom/2)"
-                ;;
-            2)
-                z="min(zoom+${ZOOM_STEP}\,${ZOOM_MAX})"
-                x="iw/2-(iw/zoom/2)+(on*0.35)"
-                y="ih/2-(ih/zoom/2)-(on*0.20)"
-                ;;
-            3)
-                z="min(zoom+${ZOOM_STEP}\,${ZOOM_MAX})"
-                x="iw/2-(iw/zoom/2)-(on*0.35)"
-                y="ih/2-(ih/zoom/2)+(on*0.20)"
-                ;;
-        esac
-
-        local label="img${i}"
-        chain+="[${i}:v]scale=${KB_SCALE_W}:${KB_SCALE_H}:force_original_aspect_ratio=increase,"
-        chain+="crop=${KB_SCALE_W}:${KB_SCALE_H},"
-        chain+="zoompan=z='${z}':x='${x}':y='${y}':d=${frames}:s=1280x720:fps=${ZOOM_FPS},"
-        chain+="format=yuv420p,setsar=1[${label}];"
-
-        if [ "$i" -eq 0 ]; then
-            prev="$label"
-        else
-            local transition="${TRANSITIONS[$(( (i - 1) % ${#TRANSITIONS[@]} ))]}"
-            local offset=$((i * SLIDE_DURATION))
-            local nxt="xf${i}"
-            chain+="[${prev}][${label}]xfade=transition=${transition}:duration=${XFADE_DUR}:offset=${offset}[${nxt}];"
-            prev="$nxt"
-        fi
+build_concat_list() {
+    local list_file="$ASSET_DIR/concat_list.txt"
+    rm -f "$list_file"
+    local count=0
+    for f in "$IMAGES_DIR"/mars_sol*.jpg; do
+        [ -f "$f" ] || continue
+        echo "file '$(realpath "$f")'" >> "$list_file"
+        echo "duration $SLIDE_DURATION"  >> "$list_file"
+        count=$((count + 1))
     done
-
-    chain+="[${prev}]eq=brightness=0.06:contrast=1.18:saturation=1.15:gamma=1.04[${prev}_graded];"
-
-    SLIDESHOW_FILTER="$chain"
-    SLIDESHOW_LABEL="${prev}_graded"
+    local last_f
+    last_f=$(ls "$IMAGES_DIR"/mars_sol*.jpg 2>/dev/null | tail -1)
+    if [ -n "$last_f" ]; then
+        echo "file '$(realpath "$last_f")'" >> "$list_file"
+    fi
+    TOTAL_SLIDE_DURATION=$((count * SLIDE_DURATION))
+    echo "Concat list: $count slides × ${SLIDE_DURATION}s = ${TOTAL_SLIDE_DURATION}s total"
 }
 
 #############################################
@@ -752,25 +432,16 @@ build_slide_info_chain() {
         local cam="${CAMERA_NAMES[$i]:-Unknown Camera}"
         local edate="${EARTH_DATES[$i]:-}"
 
-        printf 'TRANSMISSION FROM MARS\nSol %s  ·  Frame %d of %d\n%s' \
-            "$CURRENT_SOL" "$idx" "$n" "$cam" \
+        printf 'SOL %s  •  IMAGE %d/%d\n%s' "$CURRENT_SOL" "$idx" "$n" "$cam" \
             > "$ASSET_DIR/slide_info${idx}.txt"
         if [ -n "$edate" ]; then
-            local edate_short="${edate:0:16}"
-            edate_short="${edate_short/T/ }"
-            printf '\nEarth Date: %s UTC' "$edate_short" >> "$ASSET_DIR/slide_info${idx}.txt"
+            printf '\nEarth Date: %s' "$edate" >> "$ASSET_DIR/slide_info${idx}.txt"
         fi
 
-        local ENABLE="between(mod(t\,${CYCLE})\,${start}\,${end})"
         local ALPHA="if(between(mod(t\,${CYCLE})\,${start}\,${end})\,if(lt(mod(t\,${CYCLE})-${start}\,0.5)\,(mod(t\,${CYCLE})-${start})/0.5\,if(gt(mod(t\,${CYCLE})-${start}\,${SLIDE_DURATION}-0.5)\,(${end}-mod(t\,${CYCLE}))/0.5\,1))\,0)"
 
-        local box="sib${idx}"
-        chain+="[${prev}]drawbox=x=365:y=548:w=350:h=118:color=black@0.55:t=fill:enable='${ENABLE}'[${box}];"
-        local barlbl="sil${idx}"
-        chain+="[${box}]drawbox=x=365:y=548:w=4:h=118:color=${MARS_RED}:t=fill:enable='${ENABLE}'[${barlbl}];"
-
         local nxt="si${idx}"
-        chain+="[${barlbl}]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/slide_info${idx}.txt:fontcolor=white:fontsize=15:line_spacing=7:x=385:y=560:alpha='${ALPHA}':borderw=1.5:bordercolor=black@0.85:${SHADOW}[${nxt}];"
+        chain+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/slide_info${idx}.txt:fontcolor=white:fontsize=${INFO_FONTSIZE}:line_spacing=${INFO_LINE_SPACING}:x=375:y=560:alpha='${ALPHA}':${SHADOW}[${nxt}];"
         prev="$nxt"
     done
 
@@ -850,7 +521,6 @@ fi
 trap 'kill "$CLOCK_PID" 2>/dev/null || true
       [ -n "$SUBS_PID" ]    && kill "$SUBS_PID"    2>/dev/null || true
       [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true
-      [ -n "${PREFETCH_PID:-}" ] && kill "$PREFETCH_PID" 2>/dev/null || true
       echo "Stream ended — cleaning up."' EXIT
 
 #############################################
@@ -862,18 +532,17 @@ build_full_filter() {
     local CTA_CYCLE=180
     local CTA_SHOW=8
 
-    build_slideshow_filter "$n_slides"
-
     local F=""
-    F+="$SLIDESHOW_FILTER"
-    F+="[${OVERLAY_INPUT_IDX}:v]scale=1280:720:flags=fast_bilinear[ovl];"
-    F+="[ovl][${SLIDESHOW_LABEL}]overlay=0:0[base];"
+    F+="[0:v]scale=1280:720:force_original_aspect_ratio=decrease,"
+    F+="pad=1280:720:(ow-iw)/2:(oh-ih)/2:black[video];"
+    F+="[1:v]scale=1280:720:flags=fast_bilinear[ovl];"
+    F+="[ovl][video]overlay=0:0[base];"
 
     build_slide_info_chain "$n_slides"
     F+="$SLIDE_INFO_CHAIN"
     local prev="$SLIDE_INFO_END"
 
-    F+="[${prev}]drawbox=x=0:y=0:w=333:h=720:color=0x05080C@0.72:t=fill[p1];"
+    F+="[${prev}]drawbox=x=0:y=0:w=333:h=720:color=black@0.62:t=fill[p1];"
     F+="[p1]drawbox=x=333:y=0:w=4:h=720:color=black@0.45:t=fill[p2];"
     F+="[p2]drawbox=x=337:y=0:w=4:h=720:color=black@0.30:t=fill[p3];"
     F+="[p3]drawbox=x=341:y=0:w=4:h=720:color=black@0.15:t=fill[p4];"
@@ -881,23 +550,23 @@ build_full_filter() {
     F+="[p5]drawbox=x=345:y=0:w=2:h=720:color=${MARS_RED}@0.6:t=fill[p6];"
 
     F+="[p6]drawbox=x=27:y=28:w=11:h=11:color=${RED}:t=fill:enable='lt(mod(t\,1)\,0.6)'[p7];"
-    F+="[p7]drawtext=fontfile=${FONT}:expansion=none:text='LIVE':fontcolor=white:fontsize=30:x=44:y=19[p8];"
+    F+="[p7]drawtext=fontfile=${FONT}:text='LIVE':fontcolor=white:fontsize=30:x=44:y=19[p8];"
 
-    F+="[p8]drawtext=fontfile=${FONT}:expansion=none:text='Credits\: NASA/JPL-Caltech':fontcolor=white@0.85:fontsize=13:x=313-text_w:y=19[p9];"
-    F+="[p9]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/clock.txt:reload=1:fontcolor=${GOLD}:fontsize=13:x=313-text_w:y=37[p10];"
-    F+="[p10]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/subs.txt:reload=1:fontcolor=white@0.75:fontsize=12:x=313-text_w:y=55[p10b];"
-    F+="[p10b]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/viewers.txt:reload=1:fontcolor=white@0.75:fontsize=12:x=313-text_w:y=72[p10c];"
+    F+="[p8]drawtext=fontfile=${FONT}:text='Credits\: NASA/JPL-Caltech':fontcolor=white@0.85:fontsize=13:x=313-text_w:y=19[p9];"
+    F+="[p9]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/clock.txt:reload=1:fontcolor=${GOLD}:fontsize=13:x=313-text_w:y=37[p10];"
+    F+="[p10]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/subs.txt:reload=1:fontcolor=white@0.75:fontsize=12:x=313-text_w:y=55[p10b];"
+    F+="[p10b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/viewers.txt:reload=1:fontcolor=white@0.75:fontsize=12:x=313-text_w:y=72[p10c];"
 
-    F+="[p10c]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/title1.txt:fontcolor=${MARS_RED}:fontsize=26:x=33:y=95:${SHADOW}[p11];"
-    F+="[p11]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/title2.txt:fontcolor=white@0.90:fontsize=15:x=33:y=127:${SHADOW}[p12];"
+    F+="[p10c]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/title1.txt:fontcolor=${MARS_RED}:fontsize=26:x=33:y=95:${SHADOW}[p11];"
+    F+="[p11]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/title2.txt:fontcolor=white@0.90:fontsize=15:x=33:y=127:${SHADOW}[p12];"
     F+="[p12]drawbox=x=33:y=157:w=280:h=2:color=white@0.3:t=fill[p13];"
 
     F+="[p13]drawbox=x=33:y=171:w=10:h=10:color=${MARS_RED}:t=fill[p14];"
-    F+="[p14]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/header.txt:fontcolor=${GOLD}:fontsize=14:x=50:y=169[p15];"
-    F+="[p15]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/eyebrow.txt:fontcolor=${MARS_RED}@0.90:fontsize=12:x=33:y=198[p16];"
+    F+="[p14]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/header.txt:fontcolor=${GOLD}:fontsize=14:x=50:y=169[p15];"
+    F+="[p15]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/eyebrow.txt:fontcolor=${MARS_RED}@0.90:fontsize=12:x=33:y=198[p16];"
 
     local SLIDE_CYCLE=$((n_slides * SLIDE_DURATION))
-    F+="[p16]drawtext=fontfile=${FONT}:expansion=none:text='IMAGE GALLERY':fontcolor=white@0.35:fontsize=9:x=33:y=225[pgcap];"
+    F+="[p16]drawtext=fontfile=${FONT}:text='IMAGE GALLERY':fontcolor=white@0.35:fontsize=9:x=33:y=225[pgcap];"
     F+="[pgcap]drawbox=x=33:y=238:w=280:h=3:color=white@0.15:t=fill[pg1];"
     F+="[pg1]drawbox=x=33:y=238:w='280*(mod(t\,${SLIDE_DURATION}))/${SLIDE_DURATION}':h=3:color=${MARS_RED}:t=fill[pg2];"
 
@@ -922,7 +591,7 @@ build_full_filter() {
 
     F+="[${prev2}]drawbox=x=33:y=282:w=280:h=2:color=${MARS_RED}@0.5:t=fill[fp0];"
     F+="[fp0]drawbox=x=33:y=289:w=8:h=8:color=${GOLD}:t=fill[fp0b];"
-    F+="[fp0b]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/fact_label.txt:fontcolor=${GOLD}@0.90:fontsize=12:x=49:y=290[fp1];"
+    F+="[fp0b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact_label.txt:fontcolor=${GOLD}@0.90:fontsize=12:x=49:y=290[fp1];"
     local fp_prev="fp1"
     for ((i = 0; i < FACT_N; i++)); do
         local fidx=$((i + 1))
@@ -930,75 +599,35 @@ build_full_filter() {
         local fend=$((fstart + FACT_SLOT))
         local nxt="f${fidx}"
         local FALPHA="if(between(mod(t\,${FACT_CYCLE})\,${fstart}\,${fend})\,if(lt(mod(t\,${FACT_CYCLE})-${fstart}\,0.5)\,(mod(t\,${FACT_CYCLE})-${fstart})/0.5\,if(gt(mod(t\,${FACT_CYCLE})-${fstart}\,${FACT_SLOT}-0.5)\,(${fend}-mod(t\,${FACT_CYCLE}))/0.5\,1))\,0)"
-        F+="[${fp_prev}]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/fact${fidx}.txt:fontcolor=white@0.90:fontsize=16:line_spacing=7:x=33:y=318:alpha='${FALPHA}'[${nxt}];"
+        F+="[${fp_prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact${fidx}.txt:fontcolor=white@0.90:fontsize=16:line_spacing=7:x=33:y=318:alpha='${FALPHA}'[${nxt}];"
         fp_prev="$nxt"
     done
 
-    F+="[${fp_prev}]drawbox=x=10:y=415:w=326:h=135:color=black@0.45:t=fill[tl0];"
-    F+="[tl0]drawbox=x=10:y=415:w=5:h=135:color=${GOLD}:t=fill[tl1];"
-    F+="[tl1]drawtext=fontfile=${FONT}:expansion=none:text='LIVE TELEMETRY':fontcolor=${GOLD}:fontsize=11:x=22:y=422[tl2];"
-
-    F+="[tl2]drawtext=fontfile=${FONT}:expansion=none:text='TEMP\:':fontcolor=white@0.70:fontsize=12:x=22:y=441[tl3];"
-    F+="[tl3]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/temp.txt:reload=1:fontcolor=${MARS_RED}:fontsize=13:x=68:y=440[tl4];"
-    F+="[tl4]drawtext=fontfile=${FONT}:expansion=none:text='WIND\:':fontcolor=white@0.70:fontsize=12:x=180:y=441[tl5];"
-    F+="[tl5]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/wind.txt:reload=1:fontcolor=white@0.90:fontsize=13:x=228:y=440[tl6];"
-
-    F+="[tl6]drawtext=fontfile=${FONT}:expansion=none:text='PRESSURE\:':fontcolor=white@0.70:fontsize=12:x=22:y=459[tl7];"
-    F+="[tl7]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/pressure.txt:reload=1:fontcolor=white@0.90:fontsize=13:x=100:y=458[tl8];"
-    F+="[tl8]drawbox=x=180:y=460:w=8:h=8:color=0x3DDC84:t=fill:enable='lt(mod(t\,3)\,2.5)'[tl9];"
-    F+="[tl9]drawtext=fontfile=${FONT}:expansion=none:text='SIGNAL LOCKED':fontcolor=white@0.85:fontsize=12:x=194:y=459[tl10];"
-
-    F+="[tl10]drawtext=fontfile=${FONT}:expansion=none:text='LOC\:':fontcolor=white@0.70:fontsize=12:x=22:y=477[tl11];"
-    F+="[tl11]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/location.txt:reload=1:fontcolor=white@0.90:fontsize=12:x=58:y=477[tl12];"
-
-    F+="[tl12]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/timeonmars.txt:reload=1:fontcolor=${GOLD}@0.90:fontsize=12:x=22:y=495[tl13];"
-
-    local STATUS_CYCLE=$((STATUS_N * STATUS_SLOT))
-    F+="[tl13]drawbox=x=22:y=513:w=9:h=9:color=0x3DDC84:t=fill:enable='lt(mod(t\,2)\,1.6)'[tl14];"
-    F+="[tl14]drawtext=fontfile=${FONT}:expansion=none:text='STATUS\:':fontcolor=white@0.70:fontsize=11:x=38:y=513[tl15];"
-    local st_prev="tl15"
-    for ((i = 0; i < STATUS_N; i++)); do
-        local sidx=$((i + 1))
-        local sstart=$((i * STATUS_SLOT))
-        local send=$((sstart + STATUS_SLOT))
-        local nxt="st${sidx}"
-        local SALPHA="if(between(mod(t\,${STATUS_CYCLE})\,${sstart}\,${send})\,if(lt(mod(t\,${STATUS_CYCLE})-${sstart}\,0.4)\,(mod(t\,${STATUS_CYCLE})-${sstart})/0.4\,if(gt(mod(t\,${STATUS_CYCLE})-${sstart}\,${STATUS_SLOT}-0.4)\,(${send}-mod(t\,${STATUS_CYCLE}))/0.4\,1))\,0)"
-        F+="[${st_prev}]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/status${sidx}.txt:fontcolor=white@0.92:fontsize=11:x=86:y=513:alpha='${SALPHA}'[${nxt}];"
-        st_prev="$nxt"
-    done
-
-    F+="[${st_prev}]drawtext=fontfile=${FONT}:expansion=none:text='POWER\:':fontcolor=white@0.70:fontsize=11:x=22:y=534[tlp1];"
-    F+="[tlp1]drawbox=x=70:y=532:w=110:h=9:color=white@0.15:t=fill[tlp2];"
-    F+="[tlp2]drawbox=x=70:y=532:w='110*(0.80+0.10*sin(t/6))':h=9:color=0x3DDC84:t=fill[tlp3];"
-    F+="[tlp3]drawbox=x=70:y=532:w=110:h=9:color=white@0.35:t=2[tlp4];"
-    F+="[tlp4]drawtext=fontfile=${FONT}:expansion=none:text='RTG STABLE':fontcolor=white@0.55:fontsize=10:x=186:y=533[tel_end];"
-
-    F+="[tel_end]drawbox=x=10:y=560:w=326:h=115:color=black@0.45:t=fill[mi0];"
+    F+="[${fp_prev}]drawbox=x=10:y=560:w=326:h=115:color=black@0.55:t=fill[mi0];"
     F+="[mi0]drawbox=x=10:y=560:w=5:h=115:color=${MARS_RED}:t=fill[mi1];"
-    F+="[mi1]drawtext=fontfile=${FONT}:expansion=none:text='MISSION STATS':fontcolor=${GOLD}:fontsize=11:x=22:y=567[mi2];"
-    F+="[mi2]drawtext=fontfile=${FONT}:expansion=none:text='Rover\: Perseverance (Percy)':fontcolor=white@0.85:fontsize=13:x=22:y=585[mi3];"
-    F+="[mi3]drawtext=fontfile=${FONT}:expansion=none:text='Landing\: Feb 18\, 2021':fontcolor=white@0.85:fontsize=13:x=22:y=602[mi4];"
-    F+="[mi4]drawtext=fontfile=${FONT}:expansion=none:text='Location\: Jezero Crater':fontcolor=white@0.85:fontsize=13:x=22:y=619[mi5];"
-    F+="[mi5]drawtext=fontfile=${FONT}:expansion=none:text='Sol\: ${CURRENT_SOL}':fontcolor=${MARS_RED}:fontsize=15:x=22:y=638[mi6];"
-    F+="[mi6]drawtext=fontfile=${FONT}:expansion=none:text='Images\: ${DOWNLOAD_COUNT} in this batch':fontcolor=white@0.75:fontsize=12:x=22:y=659[mi7];"
+    F+="[mi1]drawtext=fontfile=${FONT}:text='MISSION STATS':fontcolor=${GOLD}:fontsize=11:x=22:y=567[mi2];"
+    F+="[mi2]drawtext=fontfile=${FONT}:text='Rover\: Perseverance (Percy)':fontcolor=white@0.85:fontsize=13:x=22:y=585[mi3];"
+    F+="[mi3]drawtext=fontfile=${FONT}:text='Landing\: Feb 18\, 2021':fontcolor=white@0.85:fontsize=13:x=22:y=602[mi4];"
+    F+="[mi4]drawtext=fontfile=${FONT}:text='Location\: Jezero Crater':fontcolor=white@0.85:fontsize=13:x=22:y=619[mi5];"
+    F+="[mi5]drawtext=fontfile=${FONT}:text='Sol\: ${CURRENT_SOL}':fontcolor=${MARS_RED}:fontsize=15:x=22:y=638[mi6];"
+    F+="[mi6]drawtext=fontfile=${FONT}:text='Images\: ${DOWNLOAD_COUNT} captured today':fontcolor=white@0.75:fontsize=12:x=22:y=659[mi7];"
 
     local CTA_ALPHA="if(between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})\,if(lt(mod(t\,${CTA_CYCLE})\,0.5)\,mod(t\,${CTA_CYCLE})/0.5\,if(gt(mod(t\,${CTA_CYCLE})\,${CTA_SHOW}-0.5)\,(${CTA_SHOW}-mod(t\,${CTA_CYCLE}))/0.5\,1))\,0)"
     local CTA_ENABLE="between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})"
     F+="[mi7]drawbox=x=733:y=620:w=507:h=43:color=black@0.75:t=fill[cta_bg];"
     F+="[cta_bg]drawbox=x=733:y=620:w=4:h=43:color=${MARS_RED}:t=fill[cta_bar];"
     F+="[cta_bar]drawbox=x=755:y=636:w=11:h=11:color=${RED}:t=fill:enable='${CTA_ENABLE}'[cta_dot];"
-    F+="[cta_dot]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/cta.txt:fontcolor=white:fontsize=19:x=773:y=633:alpha='${CTA_ALPHA}'[cta_sub];"
-    F+="[cta_sub]drawtext=fontfile=${FONT}:expansion=none:text='New batch every ${SLIDE_DURATION}s':fontcolor=white@0.80:fontsize=19:x=773:y=633:enable='not(${CTA_ENABLE})'[cta_final];"
+    F+="[cta_dot]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/cta.txt:fontcolor=white:fontsize=19:x=773:y=633:alpha='${CTA_ALPHA}'[cta_sub];"
+    F+="[cta_sub]drawtext=fontfile=${FONT}:text='Images refresh each Sol':fontcolor=white@0.80:fontsize=19:x=773:y=633:enable='not(${CTA_ENABLE})'[cta_final];"
 
     F+="[cta_final]drawbox=x=0:y=680:w=1280:h=40:color=black@0.72:t=fill[tk1];"
     F+="[tk1]drawbox=x=0:y=680:w=1280:h=2:color=${MARS_RED}@0.9:t=fill[tk2];"
-    F+="[tk2]drawtext=fontfile=${FONT}:expansion=none:textfile=${ASSET_DIR}/ticker.txt:fontcolor=white:fontsize=17:borderw=2:bordercolor=black@0.6:y=695:x='w-mod(t*${TICKER_SPEED}\,text_w+w)'[tk3];"
+    F+="[tk2]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/ticker.txt:fontcolor=white:fontsize=17:borderw=2:bordercolor=black@0.6:y=695:x='w-mod(t*${TICKER_SPEED}\,text_w+w)'[tk3];"
     F+="[tk3]drawbox=x=0:y=680:w=130:h=40:color=black@0.85:t=fill[tk4];"
     F+="[tk4]drawbox=x=0:y=682:w=123:h=38:color=${MARS_RED}:t=fill[tk5];"
-    F+="[tk5]drawtext=fontfile=${FONT}:expansion=none:text='MARS LIVE':fontcolor=white:fontsize=14:x=12:y=695[tk6];"
+    F+="[tk5]drawtext=fontfile=${FONT}:text='MARS LIVE':fontcolor=white:fontsize=14:x=12:y=695[tk6];"
 
-    F+="[tk6]drawbox=x=985:y=14:w=281:h=26:color=black@0.30:t=fill[wmbg];"
-    F+="[wmbg]drawtext=fontfile=${FONT}:expansion=none:text='${CHANNEL_NAME}':fontcolor=white@0.55:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=997:y=20[wm1];"
+    F+="[tk6]drawtext=fontfile=${FONT}:text='${CHANNEL_NAME}':fontcolor=white@0.40:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=353:y=655[wm1];"
 
     local SUB_PULSE_ENABLE="lt(mod(t\,3)\,1)"
     local sub_ring_x=$((SUB_ICON_X - SUB_ICON_R))
@@ -1012,84 +641,54 @@ build_full_filter() {
 }
 
 #############################################
-# Stream one batch (directory) to YouTube
+# Stream the slideshow to YouTube
 #############################################
 run_stream() {
-    local dir="$1"
-    local n_slides="$2"
+    local n_slides="$1"
     local attempt=1
-
-    build_image_array "$dir"
-    if [ "${#IMAGE_FILES[@]}" -ne "$n_slides" ]; then
-        echo "WARNING: image array (${#IMAGE_FILES[@]}) doesn't match slide count ($n_slides) — resyncing."
-        n_slides=${#IMAGE_FILES[@]}
-    fi
-    if [ "$n_slides" -eq 0 ]; then
-        echo "ERROR: no images to stream."
-        return 1
-    fi
-
-    OVERLAY_INPUT_IDX=$n_slides
-    AUDIO_INPUT_IDX=$((n_slides + 1))
-
     local filter
     filter=$(build_full_filter "$n_slides")
 
-    local filter_script="$ASSET_DIR/filter_complex.txt"
-    printf '%s' "$filter" > "$filter_script"
-
-    local INPUT_ARGS=()
-    local f
-    for f in "${IMAGE_FILES[@]}"; do
-        INPUT_ARGS+=(-loop 1 -i "$f")
-    done
-    INPUT_ARGS+=(-loop 1 -i overlay.png)
-
-    if [ "$HAVE_MUSIC" = true ]; then
-        INPUT_ARGS+=(-stream_loop -1 -re -i "$MUSIC_FILE")
-    else
-        INPUT_ARGS+=(-f lavfi -i anullsrc=r=48000:cl=stereo)
-    fi
-
     while [ "$attempt" -le "$MAX_RETRIES" ]; do
         echo "----------------------------------------"
-        echo "Streaming Sol $CURRENT_SOL ($n_slides slides from $dir, music=${HAVE_MUSIC}) — attempt ${attempt}/${MAX_RETRIES}"
+        echo "Streaming Sol $CURRENT_SOL ($n_slides slides) — attempt ${attempt}/${MAX_RETRIES}"
         echo "----------------------------------------"
         set +e
         ffmpeg \
         -hide_banner \
         -loglevel info \
-        "${INPUT_ARGS[@]}" \
-        -filter_complex_script "$filter_script" \
+        -f concat -safe 0 -i "$ASSET_DIR/concat_list.txt" \
+        -loop 1 -i overlay.png \
+        -f lavfi -i anullsrc=r=48000:cl=stereo \
+        -filter_complex "$filter" \
         -map "[final]" \
-        -map "${AUDIO_INPUT_IDX}:a" \
-        -r 24 \
--s 1280x720 \
--c:v libx264 \
--preset ultrafast \
--tune zerolatency \
--threads 2 \
--profile:v high \
--level 4.1 \
--pix_fmt yuv420p \
--b:v 3000k \
--maxrate 3000k \
--bufsize 6000k \
--g 48 \
--keyint_min 48 \
--sc_threshold 0 \
+        -map 2:a \
+        -r 30 \
+        -s 1280x720 \
+        -c:v libx264 \
+        -preset ultrafast \
+        -tune zerolatency \
+        -threads 2 \
+        -profile:v high \
+        -level 4.1 \
+        -pix_fmt yuv420p \
+        -b:v 3000k \
+        -maxrate 3000k \
+        -bufsize 6000k \
+        -g 60 \
+        -keyint_min 60 \
+        -sc_threshold 0 \
         -c:a aac \
         -b:a 128k \
         -ar 48000 \
         -ac 2 \
-        -shortest \
         -f flv \
         "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
         local exit_code=$?
         set -e
 
         if [ "$exit_code" -eq 0 ]; then
-            echo "Batch cycle complete."
+            echo "Slideshow cycle complete."
             return 0
         fi
 
@@ -1099,97 +698,61 @@ run_stream() {
             echo "Retrying in ${RETRY_DELAY}s..."
             sleep "$RETRY_DELAY"
         else
-            echo "ERROR: Max retries reached for this batch."
+            echo "ERROR: Max retries reached — re-fetching images for next cycle."
         fi
     done
     return 1
 }
 
 #############################################
-# MAIN LOOP — double-buffered batches
-#
-# CUR_DIR streams while NXT_DIR is prefetched in
-# the background. When streaming finishes, we
-# wait for the prefetch to finish (usually
-# already done), swap CUR_DIR <-> NXT_DIR, and
-# go again — forever, newest Sol/page first,
-# stepping to older pages/Sols each batch, and
-# wrapping back to LATEST once Sol history is
-# exhausted.
+# MAIN LOOP
 #############################################
 echo ""
-echo "Starting Mars Live Stream main loop (double-buffered batches)..."
+echo "Starting Mars Live Stream main loop..."
 echo ""
 
-prepare_music
-
+LAST_STREAMED_SOL=""
 CURRENT_SOL=""
 FETCHED_IMAGES=()
 CAMERA_NAMES=()
 EARTH_DATES=()
 SOL_TIMES=()
 IMG_CAPTIONS=()
-IMAGE_FILES=()
-OVERLAY_INPUT_IDX=0
-AUDIO_INPUT_IDX=0
 DOWNLOAD_COUNT=0
 FACT_N=0
 HEAD_N=0
-STATUS_N=0
-PREFETCH_PID=""
-
-CUR_DIR="$BATCH_DIR_A"
-NXT_DIR="$BATCH_DIR_B"
-
-# Fresh start: forget any stale cursor from a previous run so we begin
-# at the true latest Sol.
-rm -f "$CURSOR_FILE"
-
-echo "Preparing first batch synchronously..."
-until fetch_and_prepare "$CUR_DIR"; do
-    echo "Initial batch fetch failed — retrying in 60s..."
-    sleep 60
-done
 
 while true; do
     echo "========================================"
-    echo "New batch cycle starting at $(date -u +'%Y-%m-%d %H:%M UTC')"
+    echo "New cycle starting at $(date -u +'%Y-%m-%d %H:%M UTC')"
     echo "========================================"
 
-    load_batch "$CUR_DIR"
-    N_SLIDES=$(ls "$CUR_DIR"/mars_sol*.jpg 2>/dev/null | wc -l | tr -d ' ')
+    if fetch_mars_images; then
+        if [ "$CURRENT_SOL" != "$LAST_STREAMED_SOL" ]; then
+            echo "New Sol detected ($CURRENT_SOL) — downloading fresh images..."
+            download_images
+            write_panel_assets
+            LAST_STREAMED_SOL="$CURRENT_SOL"
+        else
+            echo "Same Sol ($CURRENT_SOL) — reusing downloaded images, refreshing facts."
+            write_panel_assets
+        fi
 
-    if [ "$N_SLIDES" -eq 0 ]; then
-        echo "ERROR: current batch has no valid images — re-fetching in place..."
-        until fetch_and_prepare "$CUR_DIR"; do
-            echo "Re-fetch failed — retrying in 60s..."
+        N_SLIDES=$(ls "$IMAGES_DIR"/mars_sol*.jpg 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$N_SLIDES" -eq 0 ]; then
+            echo "ERROR: No local images to show. Waiting 60s and retrying..."
             sleep 60
-        done
-        continue
+            continue
+        fi
+
+        build_concat_list
+        run_stream "$N_SLIDES" || true
+    else
+        echo "ERROR: Failed to fetch Mars images. Retrying in 120s..."
+        sleep 120
     fi
-
-    write_panel_assets
-
-    # Prefetch the NEXT (older) batch in the background while this one streams
-    (
-        fetch_and_prepare "$NXT_DIR"
-    ) &
-    PREFETCH_PID=$!
-
-    run_stream "$CUR_DIR" "$N_SLIDES" || true
-
-    echo "Waiting for background prefetch of next batch (if still running)..."
-    if ! wait "$PREFETCH_PID"; then
-        echo "WARNING: prefetch of next batch failed — will retry it as the current batch next cycle."
-    fi
-    PREFETCH_PID=""
-
-    # Swap buffers: what was "next" becomes "current"
-    TMP_DIR="$CUR_DIR"
-    CUR_DIR="$NXT_DIR"
-    NXT_DIR="$TMP_DIR"
 
     echo ""
-    echo "Batch cycle complete. Swapping to next batch immediately..."
+    echo "Cycle complete. Starting next cycle immediately to check for new Sol..."
     echo ""
 done
