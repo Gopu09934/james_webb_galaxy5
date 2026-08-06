@@ -13,6 +13,14 @@ set -euo pipefail
 #      magic bytes + ffprobe before being added
 #      to the slideshow — prevents "stuck frame"
 #      caused by corrupt/HTML error downloads.
+#   3. Background music: loops continuously from
+#      a MUSIC_URL secret instead of silent audio.
+#      Downloaded once, validated via ffprobe,
+#      then looped indefinitely with -stream_loop -1.
+#      Falls back to silence if unset/unreachable.
+#   4. Images now fill the full 1280x720 frame
+#      (scale to cover + center crop) instead of
+#      being letterboxed with black bars.
 #############################################
 
 #############################################
@@ -29,6 +37,10 @@ SHOW_STATS=true
 if [ -z "${YOUTUBE_API_KEY:-}" ] || [ -z "${YOUTUBE_CHANNEL_ID:-}" ]; then
     echo "NOTICE: YOUTUBE_API_KEY / YOUTUBE_CHANNEL_ID not set — subscriber/viewer stats will be hidden."
     SHOW_STATS=false
+fi
+
+if [ -z "${MUSIC_URL:-}" ]; then
+    echo "NOTICE: MUSIC_URL not set — stream will run with silent audio."
 fi
 
 echo "========================================"
@@ -360,6 +372,49 @@ download_images() {
 }
 
 #############################################
+# FIX 3: download_background_music
+#
+# Downloads the track pointed to by MUSIC_URL
+# once at startup (not every cycle). Validates
+# it actually has an audio stream via ffprobe.
+# On any failure, MUSIC_FILE is left empty and
+# run_stream() transparently falls back to a
+# silent anullsrc track — the stream still airs.
+#############################################
+MUSIC_FILE=""
+download_background_music() {
+    if [ -z "${MUSIC_URL:-}" ]; then
+        return 0
+    fi
+
+    echo "----------------------------------------"
+    echo "Downloading background music from MUSIC_URL..."
+    echo "----------------------------------------"
+
+    local dest="$ASSET_DIR/bgm_src"
+    local attempt=1
+    while [ "$attempt" -le "$MAX_RETRIES" ]; do
+        if curl -sSL --max-time 60 --retry 2 --retry-delay 3 -o "$dest" "$MUSIC_URL"; then
+            if [ -s "$dest" ] && ffprobe -v error -select_streams a:0 \
+                -show_entries stream=codec_type -of csv=p=0 "$dest" 2>/dev/null | grep -q audio; then
+                MUSIC_FILE="$dest"
+                echo "Background music downloaded and validated: $MUSIC_FILE"
+                return 0
+            fi
+            echo "  Downloaded file failed audio validation (attempt ${attempt}/${MAX_RETRIES})."
+        else
+            echo "  Download failed (attempt ${attempt}/${MAX_RETRIES})."
+        fi
+        rm -f "$dest"
+        attempt=$((attempt + 1))
+        [ "$attempt" -le "$MAX_RETRIES" ] && sleep "$RETRY_DELAY"
+    done
+
+    echo "WARNING: Could not download valid background music after ${MAX_RETRIES} attempts — falling back to silent audio."
+    MUSIC_FILE=""
+}
+
+#############################################
 # Write panel text files
 #############################################
 write_panel_assets() {
@@ -524,6 +579,12 @@ trap 'kill "$CLOCK_PID" 2>/dev/null || true
       echo "Stream ended — cleaning up."' EXIT
 
 #############################################
+# FIX 3 (cont.): fetch the background track once
+# before the main loop starts.
+#############################################
+download_background_music
+
+#############################################
 # build_full_filter
 #############################################
 build_full_filter() {
@@ -533,8 +594,11 @@ build_full_filter() {
     local CTA_SHOW=8
 
     local F=""
-    F+="[0:v]scale=1280:720:force_original_aspect_ratio=decrease,"
-    F+="pad=1280:720:(ow-iw)/2:(oh-ih)/2:black[video];"
+    # FIX 4: cover-fill instead of letterbox — scale up to cover the
+    # 1280x720 canvas, then center-crop the overflow. Every image now
+    # fills the full 720p frame with no black bars.
+    F+="[0:v]scale=1280:720:force_original_aspect_ratio=increase,"
+    F+="crop=1280:720[video];"
     F+="[1:v]scale=1280:720:flags=fast_bilinear[ovl];"
     F+="[ovl][video]overlay=0:0[base];"
 
@@ -649,9 +713,19 @@ run_stream() {
     local filter
     filter=$(build_full_filter "$n_slides")
 
+    # FIX 3 (cont.): pick the audio input — looped background music if we
+    # have a validated local file, otherwise silent audio as a fallback.
+    local AUDIO_INPUT=()
+    if [ -n "$MUSIC_FILE" ] && [ -s "$MUSIC_FILE" ]; then
+        AUDIO_INPUT=(-stream_loop -1 -i "$MUSIC_FILE")
+    else
+        AUDIO_INPUT=(-f lavfi -i "anullsrc=r=48000:cl=stereo")
+    fi
+
     while [ "$attempt" -le "$MAX_RETRIES" ]; do
         echo "----------------------------------------"
         echo "Streaming Sol $CURRENT_SOL ($n_slides slides) — attempt ${attempt}/${MAX_RETRIES}"
+        echo "Audio source: ${MUSIC_FILE:-silent (no MUSIC_URL / download failed)}"
         echo "----------------------------------------"
         set +e
         ffmpeg \
@@ -659,7 +733,7 @@ run_stream() {
         -loglevel info \
         -f concat -safe 0 -i "$ASSET_DIR/concat_list.txt" \
         -loop 1 -i overlay.png \
-        -f lavfi -i anullsrc=r=48000:cl=stereo \
+        "${AUDIO_INPUT[@]}" \
         -filter_complex "$filter" \
         -map "[final]" \
         -map 2:a \
