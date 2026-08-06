@@ -191,27 +191,91 @@ prepare_music() {
     fi
 
     echo "----------------------------------------"
-    echo "Downloading background music from MUSIC_URL..."
+    echo "Preparing background music playlist from MUSIC_URL..."
     echo "----------------------------------------"
 
-    local attempt=1
-    while [ "$attempt" -le 3 ]; do
-        if curl -sSL --max-time 60 -o "$MUSIC_FILE" "$MUSIC_URL"; then
-            if [ -s "$MUSIC_FILE" ] && ffprobe -v error -select_streams a:0 \
-                -show_entries stream=codec_type -of csv=p=0 "$MUSIC_FILE" 2>/dev/null | grep -q audio; then
-                echo "Music downloaded and validated: $MUSIC_FILE"
-                HAVE_MUSIC=true
-                return
+    # MUSIC_URL may hold one or more direct audio URLs, separated by
+    # commas and/or newlines, e.g.:
+    #   https://.../track1.mp3,https://.../track2.mp3,https://.../track3.mp3
+    # Every valid track gets downloaded, validated, and normalized to a
+    # common format, then concatenated into one playlist file that is
+    # looped (-stream_loop -1) for the whole stream — so with several
+    # URLs you get a rotating playlist instead of one repeating song.
+    local IFS=$',\n'
+    local raw_urls=($MUSIC_URL)
+    unset IFS
+
+    local valid_tracks=()
+    local i=0
+    local raw
+    for raw in "${raw_urls[@]}"; do
+        local url
+        url=$(echo "$raw" | xargs)   # trim whitespace
+        [ -z "$url" ] && continue
+        i=$((i + 1))
+
+        local track_raw="$ASSET_DIR/bgm_raw_${i}"
+        local track_norm="$ASSET_DIR/bgm_norm_${i}.m4a"
+
+        echo "  Track ${i}: $url"
+        local attempt=1
+        local ok=false
+        while [ "$attempt" -le 3 ]; do
+            if curl -sSL --max-time 60 -o "$track_raw" "$url" \
+                && [ -s "$track_raw" ] \
+                && ffprobe -v error -select_streams a:0 -show_entries stream=codec_type \
+                   -of csv=p=0 "$track_raw" 2>/dev/null | grep -q audio; then
+                ok=true
+                break
             fi
+            echo "    download/validation failed (attempt ${attempt}/3), retrying..."
+            rm -f "$track_raw"
+            attempt=$((attempt + 1))
+            sleep 3
+        done
+
+        if [ "$ok" = true ]; then
+            # Normalize so every track shares the same codec/rate/channels —
+            # required for the concat step below to work reliably regardless
+            # of what format each source file came in as.
+            if ffmpeg -y -v error -i "$track_raw" -vn -ar 48000 -ac 2 -c:a aac -b:a 192k "$track_norm"; then
+                valid_tracks+=("$track_norm")
+                echo "    OK — normalized to $track_norm"
+            else
+                echo "    WARNING: normalization failed for track ${i}, skipping."
+            fi
+        else
+            echo "    WARNING: could not fetch valid audio for track ${i}, skipping."
         fi
-        echo "  Music download/validation failed (attempt ${attempt}/3), retrying..."
-        rm -f "$MUSIC_FILE"
-        attempt=$((attempt + 1))
-        sleep 3
+        rm -f "$track_raw"
     done
 
-    echo "WARNING: Could not fetch valid audio from MUSIC_URL — falling back to silent audio."
-    HAVE_MUSIC=false
+    if [ "${#valid_tracks[@]}" -eq 0 ]; then
+        echo "WARNING: no valid tracks from MUSIC_URL — falling back to silent audio."
+        HAVE_MUSIC=false
+        return
+    fi
+
+    if [ "${#valid_tracks[@]}" -eq 1 ]; then
+        mv -f "${valid_tracks[0]}" "$MUSIC_FILE"
+    else
+        local list_file="$ASSET_DIR/bgm_concat_list.txt"
+        : > "$list_file"
+        local t
+        for t in "${valid_tracks[@]}"; do
+            printf "file '%s'\n" "$(readlink -f "$t")" >> "$list_file"
+        done
+        if ffmpeg -y -v error -f concat -safe 0 -i "$list_file" -c copy "$MUSIC_FILE"; then
+            :
+        else
+            echo "WARNING: playlist concat failed — falling back to first track only."
+            cp -f "${valid_tracks[0]}" "$MUSIC_FILE"
+        fi
+        rm -f "${valid_tracks[@]}" "$list_file" 2>/dev/null || true
+    fi
+
+    echo "Background music playlist ready: $MUSIC_FILE (${i} URL(s) supplied, ${#valid_tracks[@]} usable track(s)). Will loop continuously."
+    HAVE_MUSIC=true
 }
 
 #############################################
@@ -868,8 +932,8 @@ build_full_filter() {
     F+="[tk4]drawbox=x=0:y=682:w=123:h=38:color=${MARS_RED}:t=fill[tk5];"
     F+="[tk5]drawtext=fontfile=${FONT}:expansion=none:text='MARS LIVE':fontcolor=white:fontsize=14:x=12:y=695[tk6];"
 
-    F+="[tk6]drawbox=x=345:y=648:w=360:h=20:color=black@0.30:t=fill[wmbg];"
-    F+="[wmbg]drawtext=fontfile=${FONT}:expansion=none:text='${CHANNEL_NAME}':fontcolor=white@0.55:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=353:y=655[wm1];"
+    F+="[tk6]drawbox=x=985:y=14:w=281:h=26:color=black@0.30:t=fill[wmbg];"
+    F+="[wmbg]drawtext=fontfile=${FONT}:expansion=none:text='${CHANNEL_NAME}':fontcolor=white@0.55:fontsize=15:borderw=1.5:bordercolor=black@0.7:x=997:y=20[wm1];"
 
     local SUB_PULSE_ENABLE="lt(mod(t\,3)\,1)"
     local sub_ring_x=$((SUB_ICON_X - SUB_ICON_R))
