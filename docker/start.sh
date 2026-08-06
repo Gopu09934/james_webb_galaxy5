@@ -68,7 +68,7 @@ CHANNEL_NAME="Technical Talk india"
 SHADOW="shadowcolor=black@0.6:shadowx=1:shadowy=1"
 INFO_FONTSIZE=19
 INFO_LINE_SPACING=8
-MAX_IMAGES=80              # lowered from 301 — 300 simultaneous zoompans/xfades was too heavy for real-time CPU encoding (was rendering at ~0.46x speed)
+MAX_IMAGES=65              # lowered from 80 — the live-telemetry panel + per-slide caption card + photo eq grading added enough filter-graph weight to push real encode speed to ~0.93x (log showed dup frames climbing); trimming image count restores real-time headroom. If speed is still <1.0x in the ffmpeg log, lower further (55-60).
 PAGE_SIZE=100              # FIX 1: server caps per-request at ~100, we paginate
 VIEWER_MIN_TO_SHOW=10
 
@@ -85,7 +85,7 @@ RETRY_DELAY=5
 # real-time bottleneck (not the encoder preset). If the stream is
 # still stuttering/lagging behind at MAX_IMAGES=80, lower it further
 # (e.g. 40-60) before touching anything else.
-ZOOM_FPS=24                 # lowered from 30 — cuts zoompan frame-render cost by ~20% with barely visible smoothness difference
+ZOOM_FPS=20                 # lowered from 24 — extra render-speed margin to offset the telemetry panel's added filter cost; still smooth enough for the slow Ken Burns pans
 XFADE_DUR=1                 # seconds of crossfade/wipe between consecutive images (kept as an integer to keep bash math simple)
 ZOOM_MAX=1.5                # max zoom factor for the Ken Burns effect
 ZOOM_STEP=0.0015            # per-frame zoom increment/decrement
@@ -615,7 +615,7 @@ build_slideshow_filter() {
     # brightened/punched up here (not on the final composite) so the
     # left info panel's contrast never depends on how bright/washed-out
     # a given Mars sky frame happens to be.
-    chain+="[${prev}]eq=brightness=0.06:contrast=1.18:saturation=1.15:gamma=1.04[${prev}_graded];"
+    chain+="[${prev}]eq=brightness=0.06:contrast=1.16[${prev}_graded];"
 
     SLIDESHOW_FILTER="$chain"
     SLIDESHOW_LABEL="${prev}_graded"
