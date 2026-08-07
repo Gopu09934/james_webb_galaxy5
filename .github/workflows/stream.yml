@@ -9,7 +9,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: "0 */1 * * *"
+    - cron: "*/30 * * * *"
 
 concurrency:
   group: mars-stream-job
