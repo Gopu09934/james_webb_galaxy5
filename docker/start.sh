@@ -399,6 +399,13 @@ write_panel_assets() {
     printf 'SUBSCRIBE for daily Mars updates'   > "$ASSET_DIR/cta.txt"
     printf 'MARS FACT'                          > "$ASSET_DIR/fact_label.txt"
 
+    # Mission-day counter — this IS accurate/live (computed locally),
+    # unlike weather, which has no live public feed for Perseverance.
+    local landing_epoch now_epoch
+    landing_epoch=$(date -u -d '2021-02-18' +%s)
+    now_epoch=$(date -u +%s)
+    MISSION_DAY=$(( (now_epoch - landing_epoch) / 86400 + 1 ))
+
     local i idx
     local SHUFFLED_FACTS=()
     while IFS= read -r line; do
@@ -654,7 +661,18 @@ build_full_filter() {
         fp_prev="$nxt"
     done
 
-    F+="[${fp_prev}]drawbox=x=10:y=560:w=326:h=115:color=black@0.55:t=fill[mi0];"
+    F+="[${fp_prev}]drawbox=x=10:y=420:w=326:h=125:color=black@0.45:t=fill[env0];"
+    F+="[env0]drawbox=x=10:y=420:w=5:h=125:color=${GOLD}:t=fill[env1];"
+    F+="[env1]drawtext=fontfile=${FONT}:text='MARS ENVIRONMENT':fontcolor=${GOLD}:fontsize=11:x=22:y=427[env2];"
+    F+="[env2]drawtext=fontfile=${FONT}:text='Typical Conditions — Jezero Crater':fontcolor=white@0.55:fontsize=10:x=22:y=443[env3];"
+    F+="[env3]drawtext=fontfile=${FONT}:text='Night Temp\: -88C / -126F':fontcolor=white@0.85:fontsize=12:x=22:y=460[env4];"
+    F+="[env4]drawtext=fontfile=${FONT}:text='Day Temp\: -23C / -9F':fontcolor=white@0.85:fontsize=12:x=22:y=476[env5];"
+    F+="[env5]drawtext=fontfile=${FONT}:text='Pressure\: ~718 Pa (0.7%% of Earth)':fontcolor=white@0.85:fontsize=12:x=22:y=492[env6];"
+    F+="[env6]drawtext=fontfile=${FONT}:text='Wind Gusts\: ~10 m/s (22 mph)':fontcolor=white@0.85:fontsize=12:x=22:y=508[env7];"
+    F+="[env7]drawbox=x=22:y=524:w=294:h=2:color=${MARS_RED}@0.4:t=fill[env8];"
+    F+="[env8]drawtext=fontfile=${FONT}:text='Mission Day\: ${MISSION_DAY}  •  Sol ${CURRENT_SOL}':fontcolor=${MARS_RED}:fontsize=13:x=22:y=530[env9];"
+
+    F+="[env9]drawbox=x=10:y=560:w=326:h=115:color=black@0.55:t=fill[mi0];"
     F+="[mi0]drawbox=x=10:y=560:w=5:h=115:color=${MARS_RED}:t=fill[mi1];"
     F+="[mi1]drawtext=fontfile=${FONT}:text='MISSION STATS':fontcolor=${GOLD}:fontsize=11:x=22:y=567[mi2];"
     F+="[mi2]drawtext=fontfile=${FONT}:text='Rover\: Perseverance (Percy)':fontcolor=white@0.85:fontsize=13:x=22:y=585[mi3];"
@@ -709,7 +727,7 @@ run_stream() {
         ffmpeg \
         -hide_banner \
         -loglevel info \
-        -f concat -safe 0 -i "$ASSET_DIR/concat_list.txt" \
+        -re -f concat -safe 0 -i "$ASSET_DIR/concat_list.txt" \
         -loop 1 -i overlay.png \
         -f lavfi -i anullsrc=r=48000:cl=stereo \
         -filter_complex "$filter" \
