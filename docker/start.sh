@@ -23,6 +23,17 @@ if [ -z "${YOUTUBE_STREAM_KEY:-}" ]; then
     exit 1
 fi
 
+# FIX 3: fail fast if required overlay assets are missing, instead of
+# burning through MAX_RETRIES on every cycle with a cryptic ffmpeg error.
+if [ ! -f "font.ttf" ]; then
+    echo "ERROR: font.ttf not found in working directory"
+    exit 1
+fi
+if [ ! -f "overlay.png" ]; then
+    echo "ERROR: overlay.png not found in working directory"
+    exit 1
+fi
+
 NASA_API_KEY="${NASA_API_KEY:-DEMO_KEY}"
 
 SHOW_STATS=true
@@ -311,6 +322,18 @@ download_images() {
     echo "Downloading and validating $n images for Sol $CURRENT_SOL..."
     rm -f "$IMAGES_DIR"/*.jpg "$IMAGES_DIR"/*.JPG 2>/dev/null || true
 
+    # FIX 1: metadata alignment. CAMERA_NAMES/EARTH_DATES/SOL_TIMES are
+    # indexed by original fetch-order, but rejected downloads leave gaps
+    # in the actual file sequence — so "slide 3" on disk was NOT
+    # necessarily FETCHED_IMAGES[2]. Build fresh arrays here that only
+    # contain entries for images that actually made it to disk, in the
+    # same order the files are created (which matches the alphabetical
+    # concat-list order since idx increases monotonically). These are
+    # the arrays the overlay must read from, not the raw fetch arrays.
+    DL_CAMERA_NAMES=()
+    DL_EARTH_DATES=()
+    DL_SOL_TIMES=()
+
     local downloaded=0 rejected=0 idx=0
     for url in "${FETCHED_IMAGES[@]}"; do
         idx=$((idx + 1))
@@ -351,6 +374,12 @@ download_images() {
             rejected=$((rejected + 1))
             continue
         fi
+
+        # This file survived — record its metadata at the position it
+        # will occupy in the final (gap-free) slide sequence.
+        DL_CAMERA_NAMES+=("${CAMERA_NAMES[$((idx - 1))]:-Unknown Camera}")
+        DL_EARTH_DATES+=("${EARTH_DATES[$((idx - 1))]:-}")
+        DL_SOL_TIMES+=("${SOL_TIMES[$((idx - 1))]:-}")
 
         downloaded=$((downloaded + 1))
     done
@@ -442,15 +471,19 @@ start_slide_info_writer() {
         local start_ts
         start_ts=$(date +%s)
         while true; do
-            local now elapsed idx cam edate
+            local now elapsed idx cam edate mtime
             now=$(date +%s)
             elapsed=$(( now - start_ts ))
             idx=$(( (elapsed / SLIDE_DURATION) % n ))
-            cam="${CAMERA_NAMES[$idx]:-Unknown Camera}"
-            edate="${EARTH_DATES[$idx]:-}"
+            # FIX 1: read from the download-aligned arrays, not the raw
+            # fetch arrays — these match the actual on-disk slide order.
+            cam="${DL_CAMERA_NAMES[$idx]:-Unknown Camera}"
+            edate="${DL_EARTH_DATES[$idx]:-}"
+            mtime="${DL_SOL_TIMES[$idx]:-}"
             {
                 printf 'SOL %s  •  IMAGE %d/%d\n%s' "$CURRENT_SOL" "$((idx + 1))" "$n" "$cam"
                 [ -n "$edate" ] && printf '\nEarth Date: %s' "$edate"
+                [ -n "$mtime" ] && printf '\nMars Time: %s' "$mtime"
             } > "$ASSET_DIR/slide_info_current.txt.tmp"
             mv -f "$ASSET_DIR/slide_info_current.txt.tmp" "$ASSET_DIR/slide_info_current.txt"
             sleep 1
@@ -737,7 +770,9 @@ FETCHED_IMAGES=()
 CAMERA_NAMES=()
 EARTH_DATES=()
 SOL_TIMES=()
-IMG_CAPTIONS=()
+DL_CAMERA_NAMES=()
+DL_EARTH_DATES=()
+DL_SOL_TIMES=()
 DOWNLOAD_COUNT=0
 FACT_N=0
 HEAD_N=0
