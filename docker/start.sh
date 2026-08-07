@@ -64,7 +64,7 @@ IMAGES_DIR="mars_images"
 SLIDE_DURATION=12
 FACT_SLOT=10
 TICKER_SPEED=100
-CHANNEL_NAME="Technical Talk india"
+CHANNEL_NAME="."
 SHADOW="shadowcolor=black@0.6:shadowx=1:shadowy=1"
 INFO_FONTSIZE=19
 INFO_LINE_SPACING=8
