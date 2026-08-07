@@ -49,7 +49,17 @@ INFO_LINE_SPACING=8
 MAX_IMAGES=30              # max images to pull per Sol
 VIEWER_MIN_TO_SHOW=10
 OLDEST_SOL=0                # never walk back past this Sol
-URL_CHECK_TIMEOUT=6         # seconds for HEAD check per image URL
+
+# An image only makes it into the concat list if it can be FULLY
+# fetched within this many seconds. Anything slower than this is
+# "stuck" and gets kicked out before ffmpeg ever sees it — this is
+# what stops the frozen-frame/dup-frame problem.
+IMAGE_FETCH_TIMEOUT=6
+# Hard ceiling ffmpeg itself will wait on a read once streaming —
+# kept below SLIDE_DURATION so a mid-stream stall errors out fast
+# (triggering the retry/next-Sol logic) instead of silently
+# duplicating frames for minutes.
+FFMPEG_RW_TIMEOUT_US=8000000
 
 SUB_ICON_X=1249
 SUB_ICON_Y=677
@@ -193,27 +203,54 @@ fetch_images_for_sol() {
 
 #############################################
 # validate_live_urls
-# Quick HEAD request per image URL (not a
-# download) to drop dead/unreachable links
-# before they can stall ffmpeg mid-stream.
-# Rebuilds FETCHED_IMAGES/CAMERA_NAMES/EARTH_DATES
-# with only the URLs that responded OK.
+# Does a REAL timed fetch of each image (to
+# /dev/null, nothing kept on disk) to prove it
+# can be pulled fast enough to keep up with the
+# slideshow. A HEAD check isn't enough — HEAD
+# responds instantly even when the actual image
+# body is slow, which is exactly what was
+# causing ffmpeg to stall on one frame while it
+# waited for the full body mid-stream. Anything
+# that doesn't finish inside IMAGE_FETCH_TIMEOUT
+# is dropped here — "kicked out" before ffmpeg
+# ever touches it — so no single image can freeze
+# the stream once run_stream starts.
 #############################################
 validate_live_urls() {
     local ok_urls=() ok_cams=() ok_dates=()
-    local i url
+    local i url t0 t1 elapsed
     for i in "${!FETCHED_IMAGES[@]}"; do
         url="${FETCHED_IMAGES[$i]}"
-        if curl -sSL --head --max-time "$URL_CHECK_TIMEOUT" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null | grep -qE '^(2|3)'; then
+        t0=$(date +%s.%N)
+        if curl -sSL --max-time "$IMAGE_FETCH_TIMEOUT" -o /dev/null -w '%{http_code}' "$url" 2>/dev/null | grep -qE '^(2|3)'; then
+            t1=$(date +%s.%N)
+            elapsed=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b-a}')
+            echo "    OK  (${elapsed}s) $url"
             ok_urls+=("$url")
             ok_cams+=("${CAMERA_NAMES[$i]:-Unknown Camera}")
             ok_dates+=("${EARTH_DATES[$i]:-}")
+        else
+            echo "    SKIP (too slow / dead, >${IMAGE_FETCH_TIMEOUT}s) $url"
         fi
     done
     FETCHED_IMAGES=("${ok_urls[@]}")
     CAMERA_NAMES=("${ok_cams[@]}")
     EARTH_DATES=("${ok_dates[@]}")
-    echo "  ${#FETCHED_IMAGES[@]} / of checked URLs are live and will be streamed."
+    echo "  ${#FETCHED_IMAGES[@]} images passed the fetch-speed check and will be streamed."
+}
+
+#############################################
+# esc_pct
+# drawtext's textfile expansion treats a bare
+# % as the start of a format code (%{...}) —
+# any text containing a literal % (e.g. a Mars
+# fact like "...carbon dioxide (95%)") breaks
+# the filter with "Stray % near ..." every
+# single frame. Doubling it to %% makes it a
+# literal percent sign again.
+#############################################
+esc_pct() {
+    printf '%s' "$1" | sed 's/%/%%/g'
 }
 
 #############################################
@@ -235,7 +272,7 @@ write_panel_assets() {
     FACT_N=${#SHUFFLED_FACTS[@]}
     for i in "${!SHUFFLED_FACTS[@]}"; do
         idx=$((i + 1))
-        echo "${SHUFFLED_FACTS[$i]}" | fold -s -w 24 > "$ASSET_DIR/fact${idx}.txt"
+        esc_pct "${SHUFFLED_FACTS[$i]}" | fold -s -w 24 > "$ASSET_DIR/fact${idx}.txt"
     done
 
     local SHUFFLED_HEADS=()
@@ -248,7 +285,7 @@ write_panel_assets() {
     for line in "${SHUFFLED_HEADS[@]}"; do
         TICKER_STRING+="${line}     •     "
     done
-    printf '%s' "$TICKER_STRING" > "$ASSET_DIR/ticker.txt"
+    esc_pct "$TICKER_STRING" > "$ASSET_DIR/ticker.txt"
 }
 
 #############################################
@@ -292,8 +329,9 @@ build_slide_info_chain() {
         local idx=$((i + 1))
         local start=$((i * SLIDE_DURATION))
         local end=$((start + SLIDE_DURATION))
-        local cam="${CAMERA_NAMES[$i]:-Unknown Camera}"
-        local edate="${EARTH_DATES[$i]:-}"
+        local cam edate
+        cam=$(esc_pct "${CAMERA_NAMES[$i]:-Unknown Camera}")
+        edate=$(esc_pct "${EARTH_DATES[$i]:-}")
 
         printf 'SOL %s  •  IMAGE %d/%d\n%s' "$CURRENT_SOL" "$idx" "$n" "$cam" \
             > "$ASSET_DIR/slide_info${idx}.txt"
@@ -526,7 +564,7 @@ run_stream() {
         -hide_banner \
         -loglevel info \
         -protocol_whitelist file,http,https,tcp,tls,crypto \
-        -rw_timeout 15000000 \
+        -rw_timeout "$FFMPEG_RW_TIMEOUT_US" \
         -f concat -safe 0 -i "$ASSET_DIR/concat_list.txt" \
         -loop 1 -i overlay.png \
         -f lavfi -i anullsrc=r=48000:cl=stereo \
