@@ -404,6 +404,13 @@ write_panel_assets() {
     for i in "${!SHUFFLED_FACTS[@]}"; do
         idx=$((i + 1))
         echo "${SHUFFLED_FACTS[$i]}" | fold -s -w 24 > "$ASSET_DIR/fact${idx}.txt"
+        # Single-line, width-capped version for the fixed-height fact
+        # strip (640px wide box at fontsize 13 ≈ 88 chars max).
+        local one_line="${SHUFFLED_FACTS[$i]}"
+        if [ "${#one_line}" -gt 88 ]; then
+            one_line="${one_line:0:85}..."
+        fi
+        printf '%s' "$one_line" > "$ASSET_DIR/fact${idx}_oneline.txt"
     done
 
     local SHUFFLED_HEADS=()
@@ -447,7 +454,7 @@ build_concat_list() {
 start_slide_info_writer() {
     local n="$1"
     printf ' ' > "$ASSET_DIR/slide_info_current.txt"
-    printf ' ' > "$ASSET_DIR/camera_current.txt"
+    printf ' ' > "$ASSET_DIR/camera_name_only.txt"
     (
         local start_ts
         start_ts=$(date +%s)
@@ -466,9 +473,11 @@ start_slide_info_writer() {
             } > "$ASSET_DIR/slide_info_current.txt.tmp"
             mv -f "$ASSET_DIR/slide_info_current.txt.tmp" "$ASSET_DIR/slide_info_current.txt"
 
-            # New: dedicated "CAMERA" line for the mockup-style left panel
-            printf 'CAMERA\n%s' "$cam" > "$ASSET_DIR/camera_current.txt.tmp"
-            mv -f "$ASSET_DIR/camera_current.txt.tmp" "$ASSET_DIR/camera_current.txt"
+            # Camera name only — the "CAMERA" label itself is now static
+            # text in the filter graph, so this file just holds the value
+            # and can't collide with its own label.
+            printf '%s' "$cam" > "$ASSET_DIR/camera_name_only.txt.tmp"
+            mv -f "$ASSET_DIR/camera_name_only.txt.tmp" "$ASSET_DIR/camera_name_only.txt"
 
             sleep 1
         done
@@ -583,61 +592,78 @@ build_full_filter() {
     F+="[1:v]scale=1280:720:flags=fast_bilinear[ovl];"
     F+="[ovl][video]overlay=0:0[base];"
 
-    # --- Top-left title scrim + title text ---
-    F+="[base]drawbox=x=0:y=0:w=680:h=250:color=black@0.35:t=fill[t0];"
-    F+="[t0]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/title1.txt:fontcolor=white:fontsize=64:x=40:y=28:${SHADOW}[t1];"
-    F+="[t1]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/title2.txt:fontcolor=${MARS_RED}:fontsize=30:x=40:y=105:${SHADOW}[t2];"
-    F+="[t2]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/eyebrow.txt:fontcolor=white@0.90:fontsize=18:x=40:y=148:${SHADOW}[t3];"
+    # --- Top-left title scrim (feathered: 3 stacked boxes, fades out
+    #     instead of ending in one hard-edged rectangle) + title text ---
+    F+="[base]drawbox=x=0:y=0:w=620:h=180:color=black@0.45:t=fill[tg1];"
+    F+="[tg1]drawbox=x=0:y=180:w=620:h=25:color=black@0.28:t=fill[tg2];"
+    F+="[tg2]drawbox=x=0:y=205:w=620:h=25:color=black@0.12:t=fill[t0];"
+    F+="[t0]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/title1.txt:fontcolor=white:fontsize=64:x=40:y=20:${SHADOW}[t1];"
+    F+="[t1]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/title2.txt:fontcolor=${MARS_RED}:fontsize=30:x=40:y=97:${SHADOW}[t2];"
+    F+="[t2]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/eyebrow.txt:fontcolor=white@0.90:fontsize=18:x=40:y=140:${SHADOW}[t3];"
 
     # --- LIVE pill (top-left, under title) ---
-    F+="[t3]drawbox=x=40:y=185:w=11:h=11:color=${RED}:t=fill:enable='lt(mod(t\,1)\,0.6)'[t4];"
-    F+="[t4]drawtext=fontfile=${FONT}:text='LIVE':fontcolor=white:fontsize=22:x=58:y=176[t5];"
-    F+="[t5]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/clock.txt:reload=1:fontcolor=${GOLD}:fontsize=15:x=130:y=182[t6];"
+    F+="[t3]drawbox=x=40:y=173:w=11:h=11:color=${RED}:t=fill:enable='lt(mod(t\,1)\,0.6)'[t4];"
+    F+="[t4]drawtext=fontfile=${FONT}:text='LIVE':fontcolor=white:fontsize=22:x=58:y=164[t5];"
+    F+="[t5]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/clock.txt:reload=1:fontcolor=${GOLD}:fontsize=15:x=130:y=170[t6];"
 
-    # --- Bottom-left two-column stat panel scrim ---
-    F+="[t6]drawbox=x=33:y=380:w=740:h=280:color=black@0.55:t=fill[s0];"
-    F+="[s0]drawbox=x=33:y=380:w=740:h=3:color=${MARS_RED}@0.8:t=fill[s1];"
+    # --- Bottom-left two-column stat panel ---
+    # Shrunk to fit its content (560x200, was 740x235) — bottom now at
+    # y=580, fact strip starts y=587.
+    F+="[t6]drawbox=x=33:y=380:w=560:h=200:color=black@0.55:t=fill[s0];"
+    F+="[s0]drawbox=x=33:y=380:w=560:h=3:color=${MARS_RED}@0.8:t=fill[s1];"
 
     # Left column: Sol/elapsed, Location, Rover, Camera
-    F+="[s1]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/info_sol.txt:fontcolor=${GOLD}:fontsize=17:x=60:y=405:${SHADOW}[s2];"
-    F+="[s2]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/info_elapsed.txt:fontcolor=white@0.85:fontsize=15:x=60:y=430:${SHADOW}[s3];"
-    F+="[s3]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/info_location.txt:fontcolor=white:fontsize=17:line_spacing=4:x=60:y=470:${SHADOW}[s4];"
-    F+="[s4]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/info_rover.txt:fontcolor=white:fontsize=17:line_spacing=4:x=60:y=520:${SHADOW}[s5];"
-    F+="[s5]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/camera_current.txt:reload=1:fontcolor=white:fontsize=17:line_spacing=4:x=60:y=570:${SHADOW}[s6];"
+    F+="[s1]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/info_sol.txt:fontcolor=${GOLD}:fontsize=15:x=55:y=396:${SHADOW}[s2];"
+    F+="[s2]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/info_elapsed.txt:fontcolor=white@0.85:fontsize=13:x=55:y=416:${SHADOW}[s3];"
+    F+="[s3]drawtext=fontfile=${FONT}:text='LOCATION':fontcolor=${GOLD}:fontsize=13:x=55:y=444:${SHADOW}[s3b];"
+    F+="[s3b]drawtext=fontfile=${FONT}:text='Jezero Crater':fontcolor=white:fontsize=15:x=55:y=462:${SHADOW}[s4];"
+    F+="[s4]drawtext=fontfile=${FONT}:text='ROVER':fontcolor=${GOLD}:fontsize=13:x=55:y=490:${SHADOW}[s4b];"
+    F+="[s4b]drawtext=fontfile=${FONT}:text='Perseverance':fontcolor=white:fontsize=15:x=55:y=508:${SHADOW}[s5];"
+    F+="[s5]drawtext=fontfile=${FONT}:text='CAMERA':fontcolor=${GOLD}:fontsize=13:x=55:y=536:${SHADOW}[s5b];"
+    F+="[s5b]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/camera_name_only.txt:reload=1:fontcolor=white:fontsize=15:x=55:y=554:${SHADOW}[s6];"
 
     # Right column: Downlink, Typical Conditions, Power source
-    F+="[s6]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/info_downlink.txt:fontcolor=white:fontsize=17:line_spacing=4:x=420:y=405:${SHADOW}[s7];"
-    F+="[s7]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/info_weather.txt:fontcolor=white@0.90:fontsize=15:line_spacing=5:x=420:y=460:${SHADOW}[s8];"
-    F+="[s8]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/info_power.txt:fontcolor=${GREEN}:fontsize=17:line_spacing=4:x=420:y=545:${SHADOW}[s9];"
+    F+="[s6]drawtext=fontfile=${FONT}:text='DOWNLINK':fontcolor=${GOLD}:fontsize=13:x=320:y=396:${SHADOW}[s7a];"
+    F+="[s7a]drawtext=fontfile=${FONT}:text='Deep Space Network':fontcolor=white:fontsize=15:x=320:y=414:${SHADOW}[s7];"
+    F+="[s7]drawtext=fontfile=${FONT}:text='TYPICAL CONDITIONS (Jezero)':fontcolor=${GOLD}:fontsize=12:x=320:y=444:${SHADOW}[s7b];"
+    F+="[s7b]drawtext=fontfile=${FONT}:text='Night -88C  •  Day -23C':fontcolor=white@0.90:fontsize=13:x=320:y=462:${SHADOW}[s7c];"
+    F+="[s7c]drawtext=fontfile=${FONT}:text='Pressure ~718 Pa':fontcolor=white@0.90:fontsize=13:x=320:y=480:${SHADOW}[s8];"
+    F+="[s8]drawtext=fontfile=${FONT}:text='POWER SOURCE':fontcolor=${GOLD}:fontsize=13:x=320:y=508:${SHADOW}[s8b];"
+    F+="[s8b]drawtext=fontfile=${FONT}:text='RTG (Radioisotope) — Nuclear':fontcolor=${GREEN}:fontsize=15:x=320:y=526:${SHADOW}[s9];"
 
-    # --- Mars fact ticker line inside the panel footer ---
-    local fp_prev="s9"
+    # --- Mars fact strip — own box directly below the panel, 7px gap ---
+    F+="[s9]drawbox=x=33:y=587:w=560:h=40:color=black@0.45:t=fill[fb0];"
+    F+="[fb0]drawtext=fontfile=${FONT}:text='MARS FACT':fontcolor=${GOLD}@0.90:fontsize=10:x=50:y=592[fb1];"
+    local fp_prev="fb1"
     for ((i = 0; i < FACT_N; i++)); do
         local fidx=$((i + 1))
         local fstart=$((i * FACT_SLOT))
         local fend=$((fstart + FACT_SLOT))
         local nxt="f${fidx}"
         local FALPHA="if(between(mod(t\,${FACT_CYCLE})\,${fstart}\,${fend})\,if(lt(mod(t\,${FACT_CYCLE})-${fstart}\,0.5)\,(mod(t\,${FACT_CYCLE})-${fstart})/0.5\,if(gt(mod(t\,${FACT_CYCLE})-${fstart}\,${FACT_SLOT}-0.5)\,(${fend}-mod(t\,${FACT_CYCLE}))/0.5\,1))\,0)"
-        F+="[${fp_prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact${fidx}.txt:fontcolor=white@0.75:fontsize=13:line_spacing=4:x=60:y=610:alpha='${FALPHA}'[${nxt}];"
+        F+="[${fp_prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/fact${fidx}_oneline.txt:fontcolor=white@0.85:fontsize=12:x=50:y=606:alpha='${FALPHA}'[${nxt}];"
         fp_prev="$nxt"
     done
 
-    # --- Bottom-right subscribe callout ---
+    # --- CTA text — off the bottom-right corner (your overlay.png
+    # subscribe badge lives there), clear of the fact strip (ends x=593)
     local CTA_ALPHA="if(between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})\,if(lt(mod(t\,${CTA_CYCLE})\,0.5)\,mod(t\,${CTA_CYCLE})/0.5\,if(gt(mod(t\,${CTA_CYCLE})\,${CTA_SHOW}-0.5)\,(${CTA_SHOW}-mod(t\,${CTA_CYCLE}))/0.5\,1))\,0)"
     local CTA_ENABLE="between(mod(t\,${CTA_CYCLE})\,0\,${CTA_SHOW})"
-    F+="[${fp_prev}]drawbox=x=980:y=655:w=267:h=55:color=black@0.75:t=fill[cta_bg];"
-    F+="[cta_bg]drawbox=x=980:y=655:w=4:h=55:color=${MARS_RED}:t=fill[cta_bar];"
-    F+="[cta_bar]drawbox=x=1002:y=672:w=11:h=11:color=${RED}:t=fill:enable='${CTA_ENABLE}'[cta_dot];"
-    F+="[cta_dot]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/cta.txt:fontcolor=white:fontsize=17:x=1020:y=665:alpha='${CTA_ALPHA}'[cta_sub];"
-    F+="[cta_sub]drawtext=fontfile=${FONT}:text='Images refresh each Sol':fontcolor=white@0.80:fontsize=17:x=1020:y=665:enable='not(${CTA_ENABLE})'[cta_final];"
+    F+="[${fp_prev}]drawbox=x=650:y=587:w=280:h=40:color=black@0.60:t=fill[cta_bg];"
+    F+="[cta_bg]drawbox=x=650:y=587:w=4:h=40:color=${MARS_RED}:t=fill[cta_bar];"
+    F+="[cta_bar]drawbox=x=668:y=603:w=10:h=10:color=${RED}:t=fill:enable='${CTA_ENABLE}'[cta_dot];"
+    F+="[cta_dot]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/cta.txt:fontcolor=white:fontsize=14:x=684:y=599:alpha='${CTA_ALPHA}'[cta_sub];"
+    F+="[cta_sub]drawtext=fontfile=${FONT}:text='Images refresh each Sol':fontcolor=white@0.80:fontsize=14:x=684:y=599:enable='not(${CTA_ENABLE})'[cta_final];"
 
     # --- Subscriber / viewer counts, small, near top-right ---
+    # (NASA/JPL-Caltech credit already lives in overlay.png per your
+    # screenshot — not duplicating it here.)
     F+="[cta_final]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/subs.txt:reload=1:fontcolor=white@0.80:fontsize=14:x=1280-text_w-20:y=20[st1];"
     F+="[st1]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/viewers.txt:reload=1:fontcolor=white@0.80:fontsize=14:x=1280-text_w-20:y=42[st2];"
-    F+="[st2]drawtext=fontfile=${FONT}:text='NASA/JPL-Caltech':fontcolor=white@0.60:fontsize=13:x=1280-text_w-20:y=64[st3];"
+    local st_prev="st2"
 
     # --- Bottom ticker bar ---
-    F+="[st3]drawbox=x=0:y=680:w=1280:h=40:color=black@0.72:t=fill[tk1];"
+    F+="[${st_prev}]drawbox=x=0:y=680:w=1280:h=40:color=black@0.72:t=fill[tk1];"
     F+="[tk1]drawbox=x=0:y=680:w=1280:h=2:color=${MARS_RED}@0.9:t=fill[tk2];"
     F+="[tk2]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/ticker.txt:fontcolor=white:fontsize=17:borderw=2:bordercolor=black@0.6:y=695:x='w-mod(t*${TICKER_SPEED}\,text_w+w)'[tk3];"
     F+="[tk3]drawbox=x=0:y=680:w=130:h=40:color=black@0.85:t=fill[tk4];"
