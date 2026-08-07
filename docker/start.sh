@@ -417,36 +417,46 @@ build_concat_list() {
 }
 
 #############################################
-# Build per-slide info overlay
+# Slide info overlay — BACKGROUND WRITER
+#
+# OLD: one drawtext node per slide (up to 301),
+# chained sequentially into the filter graph.
+# At MAX_IMAGES=301 that's 300+ extra nodes on
+# top of the ~40 fixed overlay nodes — a huge
+# -filter_complex string, slow to build/parse
+# and rebuilt from scratch every cycle.
+#
+# NEW: a single drawtext node with reload=1,
+# same pattern as the clock/subs/viewers text
+# files. A background loop (started per stream
+# attempt, matched to ffmpeg's own timer since
+# it's launched immediately before ffmpeg)
+# figures out which slide "should" be showing
+# right now and rewrites one small text file.
+# The filter graph no longer scales with n_slides.
 #############################################
-build_slide_info_chain() {
+start_slide_info_writer() {
     local n="$1"
-    local chain=""
-    local prev="base"
-    local CYCLE=$((n * SLIDE_DURATION))
-
-    for ((i = 0; i < n; i++)); do
-        local idx=$((i + 1))
-        local start=$((i * SLIDE_DURATION))
-        local end=$((start + SLIDE_DURATION))
-        local cam="${CAMERA_NAMES[$i]:-Unknown Camera}"
-        local edate="${EARTH_DATES[$i]:-}"
-
-        printf 'SOL %s  •  IMAGE %d/%d\n%s' "$CURRENT_SOL" "$idx" "$n" "$cam" \
-            > "$ASSET_DIR/slide_info${idx}.txt"
-        if [ -n "$edate" ]; then
-            printf '\nEarth Date: %s' "$edate" >> "$ASSET_DIR/slide_info${idx}.txt"
-        fi
-
-        local ALPHA="if(between(mod(t\,${CYCLE})\,${start}\,${end})\,if(lt(mod(t\,${CYCLE})-${start}\,0.5)\,(mod(t\,${CYCLE})-${start})/0.5\,if(gt(mod(t\,${CYCLE})-${start}\,${SLIDE_DURATION}-0.5)\,(${end}-mod(t\,${CYCLE}))/0.5\,1))\,0)"
-
-        local nxt="si${idx}"
-        chain+="[${prev}]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/slide_info${idx}.txt:fontcolor=white:fontsize=${INFO_FONTSIZE}:line_spacing=${INFO_LINE_SPACING}:x=375:y=560:alpha='${ALPHA}':${SHADOW}[${nxt}];"
-        prev="$nxt"
-    done
-
-    SLIDE_INFO_CHAIN="$chain"
-    SLIDE_INFO_END="$prev"
+    printf ' ' > "$ASSET_DIR/slide_info_current.txt"
+    (
+        local start_ts
+        start_ts=$(date +%s)
+        while true; do
+            local now elapsed idx cam edate
+            now=$(date +%s)
+            elapsed=$(( now - start_ts ))
+            idx=$(( (elapsed / SLIDE_DURATION) % n ))
+            cam="${CAMERA_NAMES[$idx]:-Unknown Camera}"
+            edate="${EARTH_DATES[$idx]:-}"
+            {
+                printf 'SOL %s  •  IMAGE %d/%d\n%s' "$CURRENT_SOL" "$((idx + 1))" "$n" "$cam"
+                [ -n "$edate" ] && printf '\nEarth Date: %s' "$edate"
+            } > "$ASSET_DIR/slide_info_current.txt.tmp"
+            mv -f "$ASSET_DIR/slide_info_current.txt.tmp" "$ASSET_DIR/slide_info_current.txt"
+            sleep 1
+        done
+    ) &
+    SLIDE_INFO_PID=$!
 }
 
 #############################################
@@ -518,9 +528,11 @@ if [ "$SHOW_STATS" = true ]; then
     VIEWERS_PID=$!
 fi
 
+SLIDE_INFO_PID=""
 trap 'kill "$CLOCK_PID" 2>/dev/null || true
-      [ -n "$SUBS_PID" ]    && kill "$SUBS_PID"    2>/dev/null || true
-      [ -n "$VIEWERS_PID" ] && kill "$VIEWERS_PID" 2>/dev/null || true
+      [ -n "$SUBS_PID" ]       && kill "$SUBS_PID"       2>/dev/null || true
+      [ -n "$VIEWERS_PID" ]    && kill "$VIEWERS_PID"    2>/dev/null || true
+      [ -n "$SLIDE_INFO_PID" ] && kill "$SLIDE_INFO_PID" 2>/dev/null || true
       echo "Stream ended — cleaning up."' EXIT
 
 #############################################
@@ -538,9 +550,8 @@ build_full_filter() {
     F+="[1:v]scale=1280:720:flags=fast_bilinear[ovl];"
     F+="[ovl][video]overlay=0:0[base];"
 
-    build_slide_info_chain "$n_slides"
-    F+="$SLIDE_INFO_CHAIN"
-    local prev="$SLIDE_INFO_END"
+    F+="[base]drawtext=fontfile=${FONT}:textfile=${ASSET_DIR}/slide_info_current.txt:reload=1:fontcolor=white:fontsize=${INFO_FONTSIZE}:line_spacing=${INFO_LINE_SPACING}:x=375:y=560:${SHADOW}[sinfo];"
+    local prev="sinfo"
 
     F+="[${prev}]drawbox=x=0:y=0:w=333:h=720:color=black@0.62:t=fill[p1];"
     F+="[p1]drawbox=x=333:y=0:w=4:h=720:color=black@0.45:t=fill[p2];"
@@ -568,11 +579,17 @@ build_full_filter() {
     local SLIDE_CYCLE=$((n_slides * SLIDE_DURATION))
     F+="[p16]drawtext=fontfile=${FONT}:text='IMAGE GALLERY':fontcolor=white@0.35:fontsize=9:x=33:y=225[pgcap];"
     F+="[pgcap]drawbox=x=33:y=238:w=280:h=3:color=white@0.15:t=fill[pg1];"
-    F+="[pg1]drawbox=x=33:y=238:w='280*(mod(t\,${SLIDE_DURATION}))/${SLIDE_DURATION}':h=3:color=${MARS_RED}:t=fill[pg2];"
+    # FIX: progress across the WHOLE slideshow cycle, not per-slide
+    # (was mod(t,SLIDE_DURATION) which reset every 12s regardless of
+    # which of the up-to-301 slides was actually showing).
+    F+="[pg1]drawbox=x=33:y=238:w='280*(mod(t\,${SLIDE_CYCLE}))/${SLIDE_CYCLE}':h=3:color=${MARS_RED}:t=fill[pg2];"
 
+    # FIX: dots are grouped into buckets covering ALL n_slides, not
+    # just the first 10. Previously slides 11..301 never lit any dot.
     local prev2="pg2"
     local max_dots=10
     local dot_n=$((n_slides < max_dots ? n_slides : max_dots))
+    local bucket_slides=$(( (n_slides + dot_n - 1) / dot_n ))   # ceil(n_slides / dot_n)
     for ((i = 0; i < dot_n; i++)); do
         local dot_x=$((33 + i * 26))
         local nxt="db$((i+1))"
@@ -581,8 +598,9 @@ build_full_filter() {
     done
     for ((i = 0; i < dot_n; i++)); do
         local dot_x=$((33 + i * 26))
-        local start=$((i * SLIDE_DURATION))
-        local end=$((start + SLIDE_DURATION))
+        local start=$((i * bucket_slides * SLIDE_DURATION))
+        local end=$(( (i + 1) * bucket_slides * SLIDE_DURATION ))
+        [ "$end" -gt "$SLIDE_CYCLE" ] && end=$SLIDE_CYCLE
         local ENABLE="between(mod(t\,${SLIDE_CYCLE})\,${start}\,${end})"
         local nxt="da$((i+1))"
         F+="[${prev2}]drawbox=x=${dot_x}:y=252:w=9:h=9:color=${MARS_RED}:t=fill:enable='${ENABLE}'[${nxt}];"
@@ -653,6 +671,7 @@ run_stream() {
         echo "----------------------------------------"
         echo "Streaming Sol $CURRENT_SOL ($n_slides slides) — attempt ${attempt}/${MAX_RETRIES}"
         echo "----------------------------------------"
+        start_slide_info_writer "$n_slides"
         set +e
         ffmpeg \
         -hide_banner \
@@ -686,6 +705,7 @@ run_stream() {
         "rtmp://a.rtmp.youtube.com/live2/${YOUTUBE_STREAM_KEY}"
         local exit_code=$?
         set -e
+        kill "$SLIDE_INFO_PID" 2>/dev/null || true
 
         if [ "$exit_code" -eq 0 ]; then
             echo "Slideshow cycle complete."
