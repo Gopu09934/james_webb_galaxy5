@@ -46,7 +46,7 @@ CHANNEL_NAME="Mars Live"
 SHADOW="shadowcolor=black@0.6:shadowx=1:shadowy=1"
 INFO_FONTSIZE=19
 INFO_LINE_SPACING=8
-MAX_IMAGES=30              # max images to pull per Sol
+MAX_IMAGES=1001              # max images to pull per Sol
 VIEWER_MIN_TO_SHOW=10
 OLDEST_SOL=0                # never walk back past this Sol
 
